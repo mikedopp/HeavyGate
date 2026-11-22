@@ -65,7 +65,7 @@ if _HERE not in sys.path:   # heavycloud.py sits beside this file; also when loa
     sys.path.append(_HERE)
 import heavycloud  # noqa: E402
 
-VERSION = '1.18.4'
+VERSION = '1.19.0'
 LANES = ('gpu', 'cpu')
 DEFAULT_HOME = os.path.join((os.environ.get('LOCALAPPDATA') or os.path.expanduser('~')) if os.name == 'nt' else
                             (os.environ.get('XDG_STATE_HOME') or os.path.expanduser('~/.local/state')), 'HeavyGate')
@@ -99,6 +99,7 @@ DEFAULTS = {
     'ram_over_s': 3,                            # over the ceiling this long: ended
     'guard_agents': [],                         # your coding agents' process names: the guard may end their commands
     'gated_tools': [],                          # your own tools that take a lane themselves, so the hook leaves them be
+    'guard_power_check_s': 5,                   # Linux: how often the guard looks at "shut down when done"
     'guard_min_mb': 300,                        # an agent's shell command smaller than this is never the one ended
     'guard_big_mb': 2000,                       # anything else an agent started (an MCP server, a helper): only past this
     # Apps an agent app only opened for the user (Chrome from a link in the agent's window): never ended when they sit
@@ -986,10 +987,64 @@ def set_power(on):
 
 
 def shutdown_command():
-    """Windows shutdown with no force: an app with unsaved work can still stop it and ask. HEAVYGATE_SHUTDOWN_CMD
-    replaces it (the self-tests point it at a script that only writes a file)."""
+    """Windows shutdown with no force: an app with unsaved work can still stop it and ask. On Linux, systemd's poweroff
+    (polkit decides whether this user may). HEAVYGATE_SHUTDOWN_CMD replaces it (the self-tests point it at a script
+    that only writes a file)."""
     alt = os.environ.get('HEAVYGATE_SHUTDOWN_CMD')
-    return alt.split('|') if alt else ['shutdown', '/s', '/t', '0']
+    if alt:
+        return alt.split('|')
+    return ['shutdown', '/s', '/t', '0'] if WIN else ['systemctl', 'poweroff']
+
+
+def power_step(idle_since, busy, now, s):
+    """One look at "shut down when done": (phase, seconds left, idle_since, go). phase is armed (a lane is busy),
+    idle (empty, waiting shutdown_idle_s), countdown (the last shutdown_countdown_s) or go. A job arriving at any
+    point starts the wait over. The Windows tray and the Linux guard both use it."""
+    if busy:
+        return 'armed', None, None, False
+    idle_since = now if idle_since is None else idle_since
+    idle_left = float(s['shutdown_idle_s']) - (now - idle_since)
+    total_left = idle_left + float(s['shutdown_countdown_s'])
+    if idle_left > 0:
+        return 'idle', total_left, idle_since, False
+    if total_left > 0:
+        return 'countdown', total_left, idle_since, False
+    return 'go', 0.0, None, True
+
+
+def lanes_busy(lanes=None):
+    lanes = lane_rows() if lanes is None else lanes
+    return any(L['job'] or L['queue'] for L in lanes)
+
+
+class PowerWatch:
+    """Shut down when done without a tray: the Linux guard service calls tick() every few seconds."""
+
+    def __init__(self):
+        self.idle_since, self.phase = None, None
+
+    def tick(self, now=None, s=None, busy=None):
+        now = time.time() if now is None else now
+        if not power_state():
+            self.idle_since, self.phase = None, None
+            return None
+        s = s or settings()
+        busy = lanes_busy() if busy is None else busy
+        phase, left, self.idle_since, go = power_step(self.idle_since, busy, now, s)
+        if phase != self.phase:
+            guard_note(f'shut down when done: {phase}' + (f', {fmt_eta(left)} to go' if left else ''))
+            self.phase = phase
+        if not go:
+            return phase
+        set_power(False)   # off first, so a shutdown that is refused never comes back around
+        self.idle_since, self.phase = None, None
+        cmd = shutdown_command()
+        guard_note(f'shut down when done: lanes empty, running {" ".join(cmd)}')
+        code, out = run_quiet(cmd, 60)
+        if code:
+            guard_note(f'shut down when done: {cmd[0]} refused (exit {code}): {out.strip()[:200]}. '
+                       'On Linux this user needs polkit permission to power off (see README, Linux server).')
+        return 'go'
 
 
 def describe(h):
@@ -2519,8 +2574,8 @@ def tray_running():
 
 def cmd_power(a):
     """heavy shutdown-when-done [--off]: arm or disarm shutting the PC down once the lanes are done."""
-    if not WIN:
-        print('heavy: shutdown-when-done runs in the tray, which is Windows only', file=sys.stderr)
+    if not SUPPORTED:
+        print('heavy: shutdown-when-done needs Windows or Linux', file=sys.stderr)
         return 2
     if a.off:
         set_power(False)
@@ -2529,13 +2584,22 @@ def cmd_power(a):
     set_power(True)
     s = settings()
     lanes = lane_rows()
-    busy_now = any(L['job'] or L['queue'] for L in lanes)
-    print(f"Shut down when done: ON. Once both lanes have been empty for {s['shutdown_idle_s'] // 60} min, the strip "
-          f"counts down {s['shutdown_countdown_s']} s and the PC shuts down (apps with unsaved work can still stop it).")
+    busy_now = lanes_busy(lanes)
+    if WIN:
+        print(f"Shut down when done: ON. Once both lanes have been empty for {s['shutdown_idle_s'] // 60} min, the strip "
+              f"counts down {s['shutdown_countdown_s']} s and the PC shuts down (apps with unsaved work can still stop it).")
+        print('  ' + eta_line(estimate(lanes), busy_now))
+        print('  Cancel any time: heavy shutdown-when-done --off, the tray menu, or click the strip during the countdown.')
+        if not a.no_tray and not tray_running():
+            cmd_tray(argparse.Namespace(at_sign_in=None))
+        return 0
+    wait = int(s['shutdown_idle_s']) + int(s['shutdown_countdown_s'])
+    print(f"Shut down when done: ON. Once both lanes have been empty for {fmt_eta(wait)}, the guard runs "
+          f"{' '.join(shutdown_command())}.")
     print('  ' + eta_line(estimate(lanes), busy_now))
-    print('  Cancel any time: heavy shutdown-when-done --off, the tray menu, or click the strip during the countdown.')
-    if not a.no_tray and not tray_running():
-        cmd_tray(argparse.Namespace(at_sign_in=None))
+    print('  Cancel any time: heavy shutdown-when-done --off. Its progress goes to the guard log (heavy guard --check).')
+    if not guard_running():
+        print('  The guard is NOT running, so nothing will shut down: heavy service install (or run heavy guard).')
     return 0
 
 
@@ -2693,6 +2757,95 @@ def guard_pass(s, pct, dry_run=False):
     return text
 
 
+# Linux server: the guard as a systemd user service ------------------------------------------------------------------
+SERVICE = 'heavygate.service'
+
+
+def service_path():
+    return os.path.join(os.environ.get('XDG_CONFIG_HOME') or os.path.expanduser('~/.config'), 'systemd', 'user', SERVICE)
+
+
+def service_unit(python=None, script=None, state=None):
+    """The unit file: the guard (and, on Linux, shut down when done) for this user, restarted if it ever fails."""
+    q = lambda p: '"' + p.replace('\\', '\\\\').replace('"', '\\"') + '"'
+    python, script = python or sys.executable, script or os.path.abspath(__file__)
+    env = f'Environment=HEAVYGATE_DIR={q(state)}\n' if state else ''
+    return ('[Unit]\n'
+            f'Description=HeavyGate {VERSION}: RAM guard and shut down when done\n'
+            'Documentation=https://github.com/mikedopp/HeavyGate\n\n'
+            '[Service]\n'
+            f'ExecStart={q(python)} {q(script)} guard\n'
+            f'{env}'
+            'Restart=on-failure\n'
+            'RestartSec=5\n\n'
+            '[Install]\n'
+            'WantedBy=default.target\n')
+
+
+def cmd_service(a):
+    """heavy service install|remove|status: the guard as a systemd user service (Linux)."""
+    if not LINUX:
+        print('heavy service is for Linux. On Windows: heavy guard --at-sign-in on (and the tray: heavy tray '
+              '--at-sign-in on).', file=sys.stderr)
+        return 2
+    path = service_path()
+    state = os.environ.get('HEAVYGATE_DIR')
+    sysctl = ['systemctl', '--user']
+    user = os.environ.get('USER') or os.environ.get('LOGNAME') or ''
+    if a.action == 'status':
+        installed = os.path.exists(path)
+        code, out = run_quiet(sysctl + ['is-active', SERVICE], 15) if shutil.which('systemctl') else (127, '')
+        print(f"Service: {'installed' if installed else 'not installed'} ({path}); "
+              f"systemd says {out.strip() or 'nothing (no systemctl)'}; guard {'running' if guard_running() else 'NOT running'}")
+        code, out = run_quiet(['loginctl', 'show-user', user, '-p', 'Linger'], 15) if user and shutil.which('loginctl') else (1, '')
+        if installed and 'Linger=yes' not in out:
+            print(f'  It stops when you log out. To keep it running on a server: loginctl enable-linger {user}')
+        return 0 if installed else 1
+    steps = ([sysctl + ['daemon-reload'], sysctl + ['enable', '--now', SERVICE]] if a.action == 'install' else
+             [sysctl + ['disable', '--now', SERVICE], sysctl + ['daemon-reload']])
+    if a.dry_run:
+        if a.action == 'install':
+            print(f'Would write {path}:\n')
+            print(service_unit(state=state))
+        else:
+            print(f'Would delete {path}')
+        for cmd in steps:
+            print('Would run: ' + ' '.join(cmd))
+        return 0
+    if not shutil.which('systemctl'):
+        print('heavy: no systemctl here, so no service. Run heavy guard in the background some other way '
+              '(nohup heavy guard &).', file=sys.stderr)
+        return 2
+    if a.action == 'install':
+        os.makedirs(os.path.dirname(path), exist_ok=True)
+        with open(path, 'w', encoding='utf-8', newline='\n') as f:
+            f.write(service_unit(state=state))
+        print(f'Wrote {path}')
+    else:
+        steps = steps[:1]
+    for cmd in steps:
+        code, out = run_quiet(cmd, 60)
+        if code:
+            print(f"heavy: {' '.join(cmd)} failed (exit {code}): {out.strip()[:300]}", file=sys.stderr)
+            if a.action == 'install':
+                print('  A user service needs a user systemd instance: sign in over SSH or a console once, or as root '
+                      f'run loginctl enable-linger {user}.', file=sys.stderr)
+                return 1
+    if a.action == 'remove':
+        try:
+            os.remove(path)
+            print(f'Deleted {path}')
+        except FileNotFoundError:
+            print('No service was installed.')
+        run_quiet(sysctl + ['daemon-reload'], 60)
+        return 0
+    print(f'Started {SERVICE}: the RAM guard now runs whenever this user has a systemd session.')
+    code, out = run_quiet(['loginctl', 'show-user', user, '-p', 'Linger'], 15) if user and shutil.which('loginctl') else (1, '')
+    if 'Linger=yes' not in out:
+        print(f'  On a server, keep it running with nobody signed in: loginctl enable-linger {user}')
+    return 0
+
+
 def cmd_guard(a):
     """heavy guard: keep RAM under the ceiling, whoever's agent started the job. One per user (guard.lock)."""
     if not SUPPORTED:
@@ -2723,12 +2876,19 @@ def cmd_guard(a):
     _write(lock, {'pid': os.getpid(), 'started': now_iso(), 'version': VERSION})
     guard_note(f'start: HeavyGate {VERSION} RAM guard, pid {os.getpid()}')
     s, read_at, over_since, quiet_until, said_none = settings(), time.time(), None, 0.0, 0.0
+    power, power_at = (PowerWatch() if LINUX else None), 0.0   # Windows: the tray does it
     try:
         while True:
             time.sleep(1.0)
             now = time.time()
             if now - read_at > 30:
                 s, read_at = settings(), now
+            if power and now - power_at >= float(s.get('guard_power_check_s', 5)):
+                power_at = now
+                try:
+                    power.tick(now, s)
+                except Exception as e:   # never let it stop the guard
+                    guard_note(f'shut down when done: {e!r}')
             pct = ram_load(s['ram_ceiling_pct'])[0]
             if pct < float(s['ram_ceiling_pct']):
                 over_since = None
@@ -2762,6 +2922,10 @@ def dependencies():
             ('nvidia-smi', shutil.which('nvidia-smi') or '(not found)', 'GPU use, memory and temperature for status and the log'),
             ('Ollama', settings()['ollama_url'], 'optional: /api/ps for status, keep_alive 0 to unload (free_ollama setting)'),
             ('lspci', shutil.which('lspci') or '(not found)', 'GPU name when there is no nvidia-smi'),
+            ('systemd user service', service_path(), 'optional: heavy service install runs the guard there (systemctl --user, '
+             'loginctl enable-linger to outlive your login)'),
+            ('Shut down when done', ' '.join(shutdown_command()), 'run by the guard once the lanes are done; '
+             'HEAVYGATE_SHUTDOWN_CMD replaces it (parts split on |); polkit decides whether this user may'),
             ('Run history', os.path.join(home(), 'runs.jsonl'), 'finish-time estimates: median of the last 5 runs of the same job'),
             ('Callers', 'the heavy script (or anything that runs python3 heavygate.py)', 'a test runner or build script can import heavygate and use hold()'),
         ]
@@ -3155,7 +3319,14 @@ def main(argv=None):
     cl.add_argument('--cached', action='store_true', help="don't call gh: show what was last read")
     cl.add_argument('--json', action='store_true')
     cl.add_argument('--count', dest='n_runs', type=int, default=12, help='runs: how many (default 12)')
-    pw = sub.add_parser('shutdown-when-done', help='shut the PC down once both lanes are done (the tray does it)')
+    sv = sub.add_parser('service', help='Linux: run the RAM guard (and shut down when done) as a systemd user service',
+                        description='install: write ~/.config/systemd/user/heavygate.service and start it, so the guard '
+                        'runs on a server with nobody signed in. remove: stop it and delete the unit. status: is it '
+                        'installed and running. Nothing runs as root.')
+    sv.add_argument('action', nargs='?', default='status', choices=['install', 'remove', 'status'])
+    sv.add_argument('--dry-run', action='store_true', help='print the unit and the commands, change nothing')
+    pw = sub.add_parser('shutdown-when-done', help='shut the PC down once both lanes are done (the tray does it on '
+                        'Windows, the guard service on Linux)')
     pw.add_argument('--off', action='store_true', help='cancel it')
     pw.add_argument('--no-tray', action='store_true', help="don't start the tray if it isn't running")
     a = ap.parse_args(argv)
@@ -3189,6 +3360,8 @@ def main(argv=None):
         return cmd_deps(a)
     if a.cmd == 'guard':
         return cmd_guard(a)
+    if a.cmd == 'service':
+        return cmd_service(a)
     if a.cmd == 'watch':
         return cmd_watch(a)
     if a.cmd == 'tray':

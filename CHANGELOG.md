@@ -1,5 +1,20 @@
 # HeavyGate changelog
 
+## 1.19.0 (2026-11-21)
+
+- **Linux server support.** `heavy service install` runs the RAM guard as a systemd user service
+  (`~/.config/systemd/user/heavygate.service`): it starts now, comes back if it fails, and with
+  `loginctl enable-linger` keeps watching with nobody signed in. `heavy service status` says whether it is installed,
+  running and lingering; `remove` takes it away; `--dry-run` prints the unit and commands without changing anything.
+  Nothing runs as root.
+- **Shut down when done on Linux.** With no tray on a server, the guard watches the switch: once both lanes have been
+  empty for `shutdown_idle_s` plus `shutdown_countdown_s` it runs `systemctl poweroff`, logging each step to the guard
+  log. The switch goes off before the command runs, so a refused power-off (polkit) is logged once and never loops.
+  `heavy shutdown-when-done` says when no guard is running to do it. The Windows tray now uses the same wait and
+  countdown code (`power_step`).
+- The self-test workflow runs on Ubuntu as well as Windows. New self-tests: the wait/countdown logic, the service unit,
+  and a real guard on Linux running a stand-in shutdown command.
+
 ## 1.18.4 (2026-11-21)
 
 - **Your agents and tools are settings now.** `guard_agents` (the coding agents whose commands the RAM guard may end)

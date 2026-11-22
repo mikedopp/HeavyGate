@@ -183,10 +183,12 @@ heavy free                       stop idle Gradle/Kotlin daemons (never during a
 heavy deps                       everything it depends on and where it lives
 heavy guard                      keep RAM under the ceiling: end the agent command that takes it past (background)
 heavy guard --check              RAM now, every agent command with its size, and what the guard would end
-heavy guard --at-sign-in on|off  start the guard at sign-in
+heavy guard --at-sign-in on|off  start the guard at sign-in (Windows)
+heavy service install|remove     Linux: the guard as a systemd user service (status: is it running; --dry-run)
 heavy tray                       text strip above the clock, plus a tray icon (Windows)
 heavy tray --at-sign-in on|off   start the tray at sign-in (Windows)
-heavy shutdown-when-done         shut the PC down once both lanes are done; --off cancels (Windows)
+heavy shutdown-when-done         shut the PC down once both lanes are done; --off cancels (the tray on Windows,
+                                 the guard on Linux)
 heavy cloud                      the cloud lane: GitHub Actions minutes used and left, charges, runs, workflows
 heavy cloud runs                 recent runs across your repos (--count N)
 heavy cloud advise -- COMMAND    run it here or on GitHub, and what it would cost (--os, --est, -n NAME, --json)
@@ -310,6 +312,29 @@ Actions runs too" (strip settings) brings the strip up for a GitHub run alone. S
 `cloud_auto_day_min` (60), `cloud_auto_month_min` (400), `cloud_est_min` (10), `cloud_poll_s` (15), `cloud_max_min` (60),
 `cloud_storage_gb` (0 = by plan), `cloud_keep_days` (3; 0 = never), `cloud_artifacts_s` (3600), `cloud_delete_after` (on).
 
+## Linux server
+
+A headless Linux box (a build server, a home server you reach over SSH) gets the lanes, `status`, `watch` and the
+RAM guard with no desktop at all. Run the guard as a systemd user service, so it keeps watching with nobody signed in
+and comes back if it ever fails:
+
+```sh
+./install.sh
+heavy service install           # writes ~/.config/systemd/user/heavygate.service and starts it
+loginctl enable-linger "$USER"   # keep your user's services running after you log out (may need sudo)
+heavy service status            # installed, running, and whether linger is on
+```
+
+`heavy service install --dry-run` prints the unit and the commands without changing anything; `heavy service remove`
+stops it and deletes the unit. Nothing runs as root.
+
+**Shut down when done** works there too: `heavy shutdown-when-done` arms it, and the guard runs `systemctl poweroff`
+once both lanes have been empty for `shutdown_idle_s` plus `shutdown_countdown_s`. Each step goes to the guard log
+(`heavy guard --check`). Whether a user may power off is polkit's call: on most servers only an active local session
+may, so over SSH grant it with a polkit rule for `org.freedesktop.login1.power-off` or point
+`HEAVYGATE_SHUTDOWN_CMD` at a command you allow (`sudo|-n|systemctl|poweroff` with a matching sudoers line; the parts
+are split on `|`). If the command is refused, the guard logs why and the switch is already off, so it never loops.
+
 ## Windows and Linux
 
 | | Windows | Linux |
@@ -320,7 +345,8 @@ Actions runs too" (strip settings) brings the strip up for a GitHub run alone. S
 | CPU and GPU names | yes | yes (`lspci` for non-NVIDIA) |
 | GPU use, memory, temperature | NVIDIA only | NVIDIA only |
 | Tray icon, text strip, taskbar readout | yes (readout: Windows 10 taskbar) | no, use `heavy watch` |
-| Shut down when done | yes | no |
+| Shut down when done | yes (the tray) | yes (the guard; `systemctl poweroff`) |
+| Guard runs | from sign-in (`heavy guard --at-sign-in on`) | with nobody signed in: `heavy service install` (systemd) |
 | State folder | `%LOCALAPPDATA%\HeavyGate` | `$XDG_STATE_HOME/HeavyGate` or `~/.local/state/HeavyGate` |
 
 macOS isn't supported: there, `heavy` just runs the command with no gate.

@@ -1,5 +1,5 @@
-# Runs the self-tests on a fresh Windows runner, the machine a stranger has. Started by hand:
-# gh workflow run selftest.yml -R <owner>/HeavyGate. About 10 quota minutes (Windows counts twice).
+# Runs the self-tests on fresh Windows and Linux runners, the machines a stranger has. Started by hand:
+# gh workflow run selftest.yml -R <owner>/HeavyGate. About 12 quota minutes (Windows counts twice).
 name: Self-test
 
 on:
@@ -10,15 +10,20 @@ permissions:
 
 jobs:
   selftest:
-    runs-on: windows-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [windows-latest, ubuntu-latest]
+    runs-on: ${{ matrix.os }}
     timeout-minutes: 25
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
       - name: Self-test
-        shell: pwsh
+        shell: bash
         env:
           PYTHONUTF8: '1'
           CI: 'true'
         run: |
-          python --version
-          python selftest.py
+          py=$(command -v python3 || command -v python)
+          "$py" --version
+          "$py" selftest.py

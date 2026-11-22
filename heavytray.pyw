@@ -1329,19 +1329,12 @@ class App:
         if not hg.power_state() or not st:
             self.power, self.idle_since = None, None
             return
-        if busy(st):
-            self.power, self.idle_since = {'phase': 'armed', 'secs': None}, None
-            return
-        s = hg.settings()
-        if self.idle_since is None:
-            self.idle_since = now
+        was = self.idle_since
+        phase, left, self.idle_since, go = hg.power_step(self.idle_since, busy(st), now, hg.settings())
+        if phase == 'idle' and was is None:
             log('shutdown when done: lanes empty, waiting')
-        idle_left = float(s['shutdown_idle_s']) - (now - self.idle_since)
-        total_left = idle_left + float(s['shutdown_countdown_s'])
-        if idle_left > 0:
-            self.power = {'phase': 'idle', 'secs': total_left}
-        elif total_left > 0:
-            self.power = {'phase': 'countdown', 'secs': total_left}
+        if not go:
+            self.power = {'phase': phase, 'secs': left}
         else:
             hg.set_power(False)   # off first, so a shutdown that an app blocks never comes back around
             self.power, self.idle_since = None, None

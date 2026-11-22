@@ -19,6 +19,7 @@ import unittest
 
 WIN = os.name == 'nt'
 windows_only = unittest.skipUnless(WIN, 'the tray, its shutdown and the sign-in shortcut are Windows only')
+linux_only = unittest.skipUnless(sys.platform.startswith('linux'), 'the systemd guard service is Linux only')
 HERE = os.path.dirname(os.path.abspath(__file__))
 
 
@@ -99,7 +100,8 @@ class GateTests(unittest.TestCase):
         s = {'expect_mb': {'gpu': 0, 'cpu': 0}, 'reserve_mb': 0, 'free_daemons': False, 'poll_s': 0.2, 'cpu_threads': 12,
              'free_ollama': False, 'ollama_url': 'http://127.0.0.1:9',   # never the real one
              'ram_ceiling_pct': 100, 'ram_kill_pct': 101,   # the RAM ceiling has its own tests
-             'cpu_slots': 1}   # one job at a time, so queue order is testable; two slots have their own test
+             'cpu_slots': 1,   # one job at a time, so queue order is testable; two slots have their own test
+             'disk_floor_gb': 0, 'disk_stop_gb': 0}   # a runner with under 15 GB free; the disk floor has its own tests
         s.update(extra)
         with open(os.path.join(cls.state, 'settings.json'), 'w') as f:
             json.dump(s, f)
@@ -602,6 +604,60 @@ class GateTests(unittest.TestCase):
         self.assertFalse(os.path.exists(flag))
         self.assertNotIn('Shut down when done', self.status())
 
+    def test_power_step_waits_counts_down_and_starts_over(self):
+        hg = load_gate()
+        s = {'shutdown_idle_s': 10, 'shutdown_countdown_s': 5}
+        self.assertEqual(hg.power_step(None, True, 100, s), ('armed', None, None, False))
+        phase, left, since, go = hg.power_step(None, False, 100, s)
+        self.assertEqual((phase, left, since, go), ('idle', 15, 100, False))
+        self.assertEqual(hg.power_step(100, False, 112, s)[0], 'countdown')
+        self.assertEqual(hg.power_step(100, True, 112, s)[2], None)   # a job arriving starts the wait over
+        self.assertEqual(hg.power_step(100, False, 116, s), ('go', 0.0, None, True))
+
+    def test_service_unit_runs_the_guard(self):
+        hg = load_gate()
+        unit = hg.service_unit('/usr/bin/python3', '/home/me/Heavy Gate/heavygate.py', '/srv/hg state')
+        self.assertIn('ExecStart="/usr/bin/python3" "/home/me/Heavy Gate/heavygate.py" guard', unit)
+        self.assertIn('Environment=HEAVYGATE_DIR="/srv/hg state"', unit)
+        self.assertIn('Restart=on-failure', unit)
+        self.assertIn('WantedBy=default.target', unit)
+        r = subprocess.run([sys.executable, GATE, 'service', 'install', '--dry-run'], env=self.env, capture_output=True,
+                           text=True, timeout=60)
+        if WIN:
+            self.assertEqual(r.returncode, 2)
+            self.assertIn('heavy guard --at-sign-in on', r.stderr)
+        else:
+            self.assertEqual(r.returncode, 0, r.stderr)
+            self.assertIn('ExecStart=', r.stdout)
+            self.assertIn(f'HEAVYGATE_DIR="{self.state}"', r.stdout)   # the service keeps the state folder it was made with
+            self.assertIn('Would run: systemctl --user enable --now heavygate.service', r.stdout)
+
+    @linux_only
+    def test_guard_shuts_a_linux_server_down_when_done(self):
+        """No tray on a server: the guard service watches "shut down when done" and runs the shutdown command (here a
+        stand-in that only writes a file)."""
+        marker = os.path.join(self.tmp, 'poweroff-ran')
+        env = dict(self.env, HEAVYGATE_SHUTDOWN_CMD='|'.join(['sh', '-c', f"echo ok > '{marker}'"]))
+        self.settings({'shutdown_idle_s': 1, 'shutdown_countdown_s': 1, 'guard_power_check_s': 0.5})
+        self.addCleanup(self.settings, {})
+        r = subprocess.run([sys.executable, GATE, 'shutdown-when-done'], env=env, capture_output=True, text=True, timeout=60)
+        self.assertIn('Shut down when done: ON', r.stdout)
+        self.assertIn('The guard is NOT running', r.stdout)
+        g = subprocess.Popen([sys.executable, GATE, 'guard'], env=env, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        try:
+            end = time.time() + 30
+            while not os.path.exists(marker) and time.time() < end:
+                time.sleep(0.2)
+            self.assertTrue(os.path.exists(marker), 'the guard never ran the shutdown command')
+            self.assertIsNone(self.status('--json')['shutdown_when_done'])   # switched off first
+            with open(os.path.join(self.state, 'guard.log'), encoding='utf-8') as f:
+                log = f.read()
+            self.assertIn('shut down when done: idle', log)
+            self.assertIn('shut down when done: lanes empty, running sh -c', log)
+        finally:
+            g.terminate()
+            g.wait(timeout=20)
+
     def test_status_shows_running_and_queued(self):
         a = self.gate('gpu', 'st-a', 8.0, name='Status probe job')
         time.sleep(0.8)
@@ -1026,7 +1082,7 @@ class RamCeilingTests(unittest.TestCase):
 
     def settings(self, **extra):
         s = {'expect_mb': {'gpu': 300, 'cpu': 300}, 'reserve_mb': 0, 'free_daemons': False, 'free_ollama': False,
-             'ollama_url': 'http://127.0.0.1:9', 'poll_s': 0.2}
+             'ollama_url': 'http://127.0.0.1:9', 'poll_s': 0.2, 'disk_floor_gb': 0, 'disk_stop_gb': 0}
         s.update(extra)
         with open(os.path.join(self.state, 'settings.json'), 'w') as f:
             json.dump(s, f)
@@ -1400,7 +1456,7 @@ class CloudTests(unittest.TestCase):
         self.project('NoGit', None, {'ci.yml': 'name: CI\n'})
         with open(os.path.join(self.state, 'settings.json'), 'w') as f:   # a tiny RAM need: the advice is up to the test
             json.dump({'cloud_drop_root': self.drop, 'expect_mb': {'gpu': 1, 'cpu': 1}, 'reserve_mb': 0,
-                       'free_ollama': False, 'ollama_url': 'http://127.0.0.1:9'}, f)
+                       'free_ollama': False, 'ollama_url': 'http://127.0.0.1:9', 'disk_floor_gb': 0, 'disk_stop_gb': 0}, f)
 
     def put(self, name, data):
         with open(os.path.join(self.fake, name), 'w') as f:
@@ -1637,7 +1693,7 @@ class CloudTests(unittest.TestCase):
     def cloud_settings(self, **extra):
         s = {'cloud_drop_root': self.drop, 'expect_mb': {'gpu': 1, 'cpu': 1}, 'reserve_mb': 0, 'free_ollama': False,
              'ollama_url': 'http://127.0.0.1:9', 'cloud_poll_s': 0.2, 'free_daemons': False, 'poll_s': 0.2,
-             'ram_ceiling_pct': 100, 'ram_kill_pct': 101}
+             'ram_ceiling_pct': 100, 'ram_kill_pct': 101, 'disk_floor_gb': 0, 'disk_stop_gb': 0}
         s.update(extra)
         with open(os.path.join(self.state, 'settings.json'), 'w') as f:
             json.dump(s, f)
