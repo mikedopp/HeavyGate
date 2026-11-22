@@ -1,0 +1,36 @@
+# Proves the runner probe (heavyprobe.py) keeps sampling after the step that starts it ends, on Linux and Windows.
+# Started by hand: gh workflow run probe-test.yml -R mikedopp/HeavyGate. About 4 quota minutes.
+name: Runner probe test
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  statuses: write
+
+jobs:
+  probe:
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, windows-latest]
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - name: Start the probe
+        shell: bash
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
+        run: $(command -v python3 || command -v python) heavyprobe.py --start
+      - name: Work for a minute (a later step, so the probe must outlive the one that started it)
+        shell: bash
+        run: sleep 65
+      - name: Last status
+        if: always()
+        shell: bash
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
+          JOB_STATUS: ${{ job.status }}
+        run: $(command -v python3 || command -v python) heavyprobe.py --final "$JOB_STATUS"

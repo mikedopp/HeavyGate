@@ -1,0 +1,24 @@
+# Runs the self-tests on a fresh Windows runner, the machine a stranger has. Started by hand:
+# gh workflow run selftest.yml -R <owner>/HeavyGate. About 10 quota minutes (Windows counts twice).
+name: Self-test
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  selftest:
+    runs-on: windows-latest
+    timeout-minutes: 25
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - name: Self-test
+        shell: pwsh
+        env:
+          PYTHONUTF8: '1'
+          CI: 'true'
+        run: |
+          python --version
+          python selftest.py
