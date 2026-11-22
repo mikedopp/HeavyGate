@@ -23,6 +23,8 @@
   "ram_over_s": 3,
   "guard_agents": [],
   "gated_tools": [],
+  "guard_power_check_s": 5,
+  "shutdown_command": [],
   "guard_min_mb": 300,
   "guard_big_mb": 2000,
   "guard_spare": [

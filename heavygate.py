@@ -65,7 +65,7 @@ if _HERE not in sys.path:   # heavycloud.py sits beside this file; also when loa
     sys.path.append(_HERE)
 import heavycloud  # noqa: E402
 
-VERSION = '1.19.0'
+VERSION = '1.19.1'
 LANES = ('gpu', 'cpu')
 DEFAULT_HOME = os.path.join((os.environ.get('LOCALAPPDATA') or os.path.expanduser('~')) if os.name == 'nt' else
                             (os.environ.get('XDG_STATE_HOME') or os.path.expanduser('~/.local/state')), 'HeavyGate')
@@ -100,6 +100,7 @@ DEFAULTS = {
     'guard_agents': [],                         # your coding agents' process names: the guard may end their commands
     'gated_tools': [],                          # your own tools that take a lane themselves, so the hook leaves them be
     'guard_power_check_s': 5,                   # Linux: how often the guard looks at "shut down when done"
+    'shutdown_command': [],                     # replaces the shutdown command; [] = shutdown /s or systemctl poweroff
     'guard_min_mb': 300,                        # an agent's shell command smaller than this is never the one ended
     'guard_big_mb': 2000,                       # anything else an agent started (an MCP server, a helper): only past this
     # Apps an agent app only opened for the user (Chrome from a link in the agent's window): never ended when they sit
@@ -993,7 +994,28 @@ def shutdown_command():
     alt = os.environ.get('HEAVYGATE_SHUTDOWN_CMD')
     if alt:
         return alt.split('|')
+    mine = settings().get('shutdown_command')   # a server over SSH: ["sudo", "-n", "systemctl", "poweroff"]
+    if isinstance(mine, list) and mine and all(isinstance(x, str) for x in mine):
+        return mine
     return ['shutdown', '/s', '/t', '0'] if WIN else ['systemctl', 'poweroff']
+
+
+def power_off_note():
+    """Linux: whether the shutdown command will be allowed, from logind's CanPowerOff, or None when unknown. 'challenge'
+    (over SSH, usually) means polkit would ask for a password nobody is there to type."""
+    if not LINUX or os.environ.get('HEAVYGATE_SHUTDOWN_CMD') or settings().get('shutdown_command') \
+            or not shutil.which('busctl'):
+        return None
+    code, out = run_quiet(['busctl', 'call', 'org.freedesktop.login1', '/org/freedesktop/login1',
+                           'org.freedesktop.login1.Manager', 'CanPowerOff'], 15)
+    answer = out.strip().split()[-1].strip('"') if code == 0 and out.strip() else ''
+    if answer == 'yes':
+        return 'systemctl poweroff is allowed for this user'
+    if answer:
+        return (f'systemctl poweroff is NOT allowed without a password here ({answer}). Set "shutdown_command": '
+                '["sudo", "-n", "systemctl", "poweroff"] in settings.json with a matching sudoers line, or a polkit '
+                'rule for org.freedesktop.login1.power-off')
+    return None
 
 
 def power_step(idle_since, busy, now, s):
@@ -1299,15 +1321,39 @@ def drive_of(path):
     return p
 
 
+RAM_FS = {'tmpfs', 'ramfs', 'devtmpfs'}
+
+
+def ram_backed(mount, mounts=None):
+    """True for a Linux mount that lives in RAM (tmpfs: /tmp on many servers). Its size is RAM, which the RAM ceiling
+    already watches, so the disk floor leaves it out: a 3.8 GB tmpfs /tmp refused every job on a real server."""
+    if not LINUX and mounts is None:
+        return False
+    if mounts is None:
+        try:
+            with open('/proc/self/mounts', encoding='utf-8', errors='replace') as f:
+                mounts = f.read()
+        except OSError:
+            return False
+    kind = None
+    for line in mounts.splitlines():   # the last mount on a point wins, as in the kernel
+        parts = line.split()
+        if len(parts) >= 3 and parts[1].replace('\\040', ' ') == mount:
+            kind = parts[2]
+    return kind in RAM_FS
+
+
 def watched_drives(cwd=None, s=None):
     """The drives a job here writes to: its folder's, the temp folder's and the user profile's (where Gradle, NuGet and
-    npm keep their caches), plus disk_paths. Each once, in that order."""
+    npm keep their caches), plus disk_paths. Each once, in that order. RAM-backed mounts (tmpfs) are left out."""
     s = s or settings()
     out = []
     for p in [cwd or os.getcwd(), tempfile.gettempdir(), os.path.expanduser('~'), *(s.get('disk_paths') or [])]:
         try:
             d = drive_of(p)
         except (OSError, ValueError, TypeError):
+            continue
+        if ram_backed(d):
             continue
         if os.path.normcase(d) not in {os.path.normcase(x) for x in out}:
             out.append(d)
@@ -2600,6 +2646,9 @@ def cmd_power(a):
     print('  Cancel any time: heavy shutdown-when-done --off. Its progress goes to the guard log (heavy guard --check).')
     if not guard_running():
         print('  The guard is NOT running, so nothing will shut down: heavy service install (or run heavy guard).')
+    note = power_off_note()
+    if note:
+        print('  ' + note)
     return 0
 
 
@@ -2800,6 +2849,10 @@ def cmd_service(a):
         code, out = run_quiet(['loginctl', 'show-user', user, '-p', 'Linger'], 15) if user and shutil.which('loginctl') else (1, '')
         if installed and 'Linger=yes' not in out:
             print(f'  It stops when you log out. To keep it running on a server: loginctl enable-linger {user}')
+        print(f"  Shut down when done would run: {' '.join(shutdown_command())}")
+        note = power_off_note()
+        if note:
+            print('  ' + note)
         return 0 if installed else 1
     steps = ([sysctl + ['daemon-reload'], sysctl + ['enable', '--now', SERVICE]] if a.action == 'install' else
              [sysctl + ['disable', '--now', SERVICE], sysctl + ['daemon-reload']])

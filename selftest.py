@@ -614,6 +614,29 @@ class GateTests(unittest.TestCase):
         self.assertEqual(hg.power_step(100, True, 112, s)[2], None)   # a job arriving starts the wait over
         self.assertEqual(hg.power_step(100, False, 116, s), ('go', 0.0, None, True))
 
+    def test_tmpfs_is_not_a_disk(self):
+        """A server's /tmp on tmpfs is RAM: the disk floor leaves it out (a 3.8 GB tmpfs refused every job)."""
+        hg = load_gate()
+        mounts = ('/dev/sda2 / ext4 rw 0 0\ntmpfs /tmp tmpfs rw,size=3.8g 0 0\n/dev/sdb1 /mnt/My\\040Data ext4 rw 0 0\n'
+                  'tmpfs /run tmpfs rw 0 0\n')
+        self.assertTrue(hg.ram_backed('/tmp', mounts))
+        self.assertFalse(hg.ram_backed('/', mounts))
+        self.assertFalse(hg.ram_backed('/mnt/My Data', mounts))
+        self.assertFalse(hg.ram_backed('/nowhere', mounts))
+
+    def test_shutdown_command_setting(self):
+        code = "import heavygate as h; print('|'.join(h.shutdown_command()))"
+        self.settings({'shutdown_command': ['sudo', '-n', 'systemctl', 'poweroff']})
+        try:
+            r = subprocess.run([sys.executable, '-c', code], cwd=HERE, env={k: v for k, v in self.env.items()
+                               if k != 'HEAVYGATE_SHUTDOWN_CMD'}, capture_output=True, text=True, timeout=30)
+            self.assertEqual(r.stdout.strip(), 'sudo|-n|systemctl|poweroff', r.stderr)
+        finally:
+            self.settings({})
+        r = subprocess.run([sys.executable, '-c', code], cwd=HERE, env={k: v for k, v in self.env.items()
+                           if k != 'HEAVYGATE_SHUTDOWN_CMD'}, capture_output=True, text=True, timeout=30)
+        self.assertEqual(r.stdout.strip(), 'shutdown|/s|/t|0' if WIN else 'systemctl|poweroff')
+
     def test_service_unit_runs_the_guard(self):
         hg = load_gate()
         unit = hg.service_unit('/usr/bin/python3', '/home/me/Heavy Gate/heavygate.py', '/srv/hg state')

@@ -1,5 +1,16 @@
 # HeavyGate changelog
 
+## 1.19.1 (2026-11-21)
+
+Found by running 1.19.0 on a real Linux server over SSH.
+
+- **A tmpfs `/tmp` no longer blocks every job.** The disk floor counted `/tmp`, a 3.8 GB tmpfs, as a disk and refused
+  each lane job (exit 28). RAM-backed mounts (tmpfs, ramfs, devtmpfs) are now left out; the RAM ceiling covers them.
+- **`shutdown_command` setting.** Over SSH logind answers `challenge` for power-off, so `systemctl poweroff` would be
+  refused. A server can now set the command it is allowed to run, e.g. `["sudo", "-n", "systemctl", "poweroff"]`.
+  `heavy service status` and `heavy shutdown-when-done` show the command and warn when it would be refused.
+- `install.sh` is executable in the public repo again.
+
 ## 1.19.0 (2026-11-21)
 
 - **Linux server support.** `heavy service install` runs the RAM guard as a systemd user service

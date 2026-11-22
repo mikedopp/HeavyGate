@@ -328,12 +328,16 @@ heavy service status            # installed, running, and whether linger is on
 `heavy service install --dry-run` prints the unit and the commands without changing anything; `heavy service remove`
 stops it and deletes the unit. Nothing runs as root.
 
+The disk floor (`disk_floor_gb`) watches real disks only: a `/tmp` on tmpfs is RAM, which the RAM ceiling already
+covers, so it is left out instead of refusing every job on a server with a small tmpfs.
+
 **Shut down when done** works there too: `heavy shutdown-when-done` arms it, and the guard runs `systemctl poweroff`
 once both lanes have been empty for `shutdown_idle_s` plus `shutdown_countdown_s`. Each step goes to the guard log
 (`heavy guard --check`). Whether a user may power off is polkit's call: on most servers only an active local session
-may, so over SSH grant it with a polkit rule for `org.freedesktop.login1.power-off` or point
-`HEAVYGATE_SHUTDOWN_CMD` at a command you allow (`sudo|-n|systemctl|poweroff` with a matching sudoers line; the parts
-are split on `|`). If the command is refused, the guard logs why and the switch is already off, so it never loops.
+may, and `heavy service status` says which you have. Over SSH, either add a polkit rule for
+`org.freedesktop.login1.power-off`, or set `"shutdown_command": ["sudo", "-n", "systemctl", "poweroff"]` in
+`settings.json` with a matching sudoers line (`HEAVYGATE_SHUTDOWN_CMD`, parts split on `|`, overrides it for one shell).
+If the command is refused, the guard logs why and the switch is already off, so it never loops.
 
 ## Windows and Linux
 
