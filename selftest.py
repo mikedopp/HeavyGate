@@ -72,6 +72,51 @@ sys.exit(code)
 '''
 
 
+# the cpu lane's niceness on Linux: 10 more than this process has (a test run inside a lane starts at 10 already)
+NICE_CPU = min(19, os.nice(0) + 10) if hasattr(os, 'nice') else 10
+# the processors this process may use (fewer than the machine has inside a lane, as in a heavy split piece)
+def _cpus():
+    if hasattr(os, 'sched_getaffinity'):
+        return len(os.sched_getaffinity(0))
+    if WIN:   # a lane on Windows narrows the process's affinity mask
+        import ctypes
+        from ctypes import wintypes
+        mine, system = ctypes.c_size_t(), ctypes.c_size_t()
+        k = ctypes.WinDLL('kernel32')   # its own copy: argtypes here don't leak into heavygate's
+        k.GetCurrentProcess.restype = wintypes.HANDLE
+        k.GetProcessAffinityMask.argtypes = [wintypes.HANDLE, ctypes.POINTER(ctypes.c_size_t),
+                                             ctypes.POINTER(ctypes.c_size_t)]
+        if k.GetProcessAffinityMask(k.GetCurrentProcess(), ctypes.byref(mine), ctypes.byref(system)):
+            return bin(mine.value).count('1') or os.cpu_count()
+    return os.cpu_count()
+
+
+def _desktop():
+    """True when this process can show windows and a tray icon: not in an ssh session's hidden window station."""
+    if not WIN:
+        return False
+    import ctypes
+    from ctypes import wintypes
+
+    class USEROBJECTFLAGS(ctypes.Structure):
+        _fields_ = [('fInherit', wintypes.BOOL), ('fReserved', wintypes.BOOL), ('dwFlags', wintypes.DWORD)]
+    u = ctypes.WinDLL('user32')
+    u.GetProcessWindowStation.restype = wintypes.HANDLE
+    u.GetUserObjectInformationW.argtypes = [wintypes.HANDLE, ctypes.c_int, ctypes.c_void_p, wintypes.DWORD,
+                                            ctypes.c_void_p]
+    f = USEROBJECTFLAGS()
+    if not u.GetUserObjectInformationW(u.GetProcessWindowStation(), 1, ctypes.byref(f), ctypes.sizeof(f), None):
+        return True
+    return bool(f.dwFlags & 1)   # WSF_VISIBLE
+
+
+CPUS = _cpus()
+SHARE = -(-3 * os.cpu_count() // 4)   # the cpu lane's default threads: 3/4 of the machine, as heavygate counts
+DESKTOP = _desktop()
+desktop_only = unittest.skipUnless(DESKTOP, 'needs a visible desktop: windows and the tray (not over ssh)')
+os.environ.pop('HEAVYGATE_HELD', None)   # run inside a lane (a heavy split piece): the tests start their own lanes
+
+
 def load_gate():
     spec = importlib.util.spec_from_file_location('heavygate_under_test', GATE)
     m = importlib.util.module_from_spec(spec)
@@ -186,17 +231,17 @@ class GateTests(unittest.TestCase):
     def test_cpu_lane_lowers_priority_and_threads(self):
         self.assertEqual(self.gate('cpu', 'prio', 0.1).wait(timeout=20), 0)
         r = self.rec('prio')
-        self.assertEqual(r['priority'], 0x4000 if WIN else 10)   # below normal, through the shell
-        self.assertEqual(r['threads'], min(12, os.cpu_count()))
+        self.assertEqual(r['priority'], 0x4000 if WIN else NICE_CPU)   # below normal, through the shell
+        self.assertEqual(r['threads'], SHARE)
         self.assertEqual(self.gate('gpu', 'prio-gpu', 0.1).wait(timeout=20), 0)
         self.assertEqual(self.rec('prio-gpu')['priority'], INHERITED)   # the GPU lane leaves the caller's priority
-        self.assertEqual(self.rec('prio-gpu')['threads'], os.cpu_count())
+        self.assertEqual(self.rec('prio-gpu')['threads'], CPUS)
 
     def test_threads_sets_one_jobs_share_and_no_other(self):
-        n = os.cpu_count()
+        n = CPUS
         self.assertEqual(self.gate('cpu', 'thr-2', 0.1, '--threads', '2').wait(timeout=20), 0)
         self.assertEqual(self.rec('thr-2')['threads'], 2)
-        self.assertEqual(self.rec('thr-2')['priority'], 0x4000 if WIN else 10)   # a bigger share is not a higher priority
+        self.assertEqual(self.rec('thr-2')['priority'], 0x4000 if WIN else NICE_CPU)   # a bigger share is not a higher priority
         self.assertEqual(self.gate('cpu', 'thr-all', 0.1, '--threads', str(n + 8)).wait(timeout=20), 0)
         self.assertEqual(self.rec('thr-all')['threads'], n)
         self.assertEqual(self.gate('cpu', 'thr-next', 0.1).wait(timeout=20), 0)
@@ -266,7 +311,7 @@ class GateTests(unittest.TestCase):
             r = self.auto('auto-none')
             self.assertEqual(r.returncode, 0, r.stderr)
             self.assertEqual(self.rec('auto-none')['held'], 'cpu')
-            self.assertEqual(self.rec('auto-none')['threads'], min(12, os.cpu_count()))
+            self.assertEqual(self.rec('auto-none')['threads'], SHARE)
             self.assertIn('no rule', r.stderr)
         finally:
             os.remove(os.path.join(self.state, 'rules.json'))
@@ -301,15 +346,15 @@ class GateTests(unittest.TestCase):
 
     def test_rule_matching(self):
         hg = load_gate()
-        self.assertFalse(hg.rule_matches({'match': '', 'folder': ''}, 'anything', r'F:\Code'))
+        self.assertFalse(hg.rule_matches({'match': '', 'folder': ''}, 'anything', r'C:\Code'))
         self.assertTrue(hg.rule_matches({'match': 'tar'}, 'tar czf x.tgz public'))
         self.assertTrue(hg.rule_matches({'match': 'tar'}, r'C:\tools\tar.exe x'))
         self.assertFalse(hg.rule_matches({'match': 'tar'}, 'start notepad'))
         self.assertFalse(hg.rule_matches({'match': 'gradle'}, 'gradle-wrapper-check'))
         self.assertTrue(hg.rule_matches({'match': 'BLENDER'}, 'blender.exe -b'))
-        self.assertTrue(hg.rule_matches({'match': 'build.cmd', 'folder': 'harbor'}, 'build.cmd', r'F:\Code\Harbor'))
-        self.assertFalse(hg.rule_matches({'match': 'build.cmd', 'folder': 'harbor'}, 'build.cmd', r'F:\Code\Other'))
-        self.assertTrue(hg.rule_matches({'match': '', 'folder': 'Harbor'}, 'anything', r'F:\Code\Harbor'))
+        self.assertTrue(hg.rule_matches({'match': 'build.cmd', 'folder': 'harbor'}, 'build.cmd', r'C:\Code\Harbor'))
+        self.assertFalse(hg.rule_matches({'match': 'build.cmd', 'folder': 'harbor'}, 'build.cmd', r'C:\Code\Other'))
+        self.assertTrue(hg.rule_matches({'match': '', 'folder': 'Harbor'}, 'anything', r'C:\Code\Harbor'))
 
     def test_bad_rules_are_dropped(self):
         hg = load_gate()
@@ -340,7 +385,7 @@ class GateTests(unittest.TestCase):
         hg = load_gate()
         empty = {'rules': [], 'dismissed': []}
 
-        def run(i, lane, gpu, tool='python tools/render.py -q', cpu=10, ran=60, cwd=r'F:\Code\App'):
+        def run(i, lane, gpu, tool='python tools/render.py -q', cpu=10, ran=60, cwd=r'C:\Code\App'):
             return {'lane': lane, 'command': tool, 'cwd': cwd, 'ran_s': ran, 'gpu_util_max': gpu, 'cpu_avg': cpu,
                     'started': f'2026-11-0{i}T10:00:00'}
 
@@ -355,7 +400,7 @@ class GateTests(unittest.TestCase):
         self.assertEqual([x for x in hg.suggestions(beside, empty) if x['match'] == 'render.py'], [])
         idle = [run(i, 'gpu', 4, tool='pack.py') for i in (1, 2, 3)]
         self.assertEqual(hg.suggestions(idle, empty)[0]['lane'], 'cpu')
-        plain = [run(i, 'cpu', 85, tool='build.cmd', cwd=r'F:\Code\Harbor') for i in (1, 2, 3)]
+        plain = [run(i, 'cpu', 85, tool='build.cmd', cwd=r'C:\Code\Harbor') for i in (1, 2, 3)]
         self.assertEqual(hg.suggestions(plain, empty)[0]['folder'], 'Harbor')
 
     def fake_ollama(self, *names, stuck=()):
@@ -513,7 +558,7 @@ class GateTests(unittest.TestCase):
         self.assertEqual(r.returncode, 7, r.stderr)
         self.assertIn('cpu lane', r.stderr)
 
-    @windows_only
+    @desktop_only
     def test_rules_window_drives_every_control(self):
         out = tempfile.mkdtemp(dir=self.tmp)
         r = subprocess.run([sys.executable, os.path.join(HERE, 'heavyrules.pyw'), '--selftest', out], capture_output=True,
@@ -786,7 +831,7 @@ class GateTests(unittest.TestCase):
             spinner.wait(timeout=20)
         self.assertEqual(clashes, '0')   # a job taking the lane never finds it held by a monitor
 
-    @windows_only
+    @desktop_only
     def test_tray_shows_the_lanes(self):
         a = self.gate('gpu', 'tray-a', 3.0, name='Tray probe job')
         time.sleep(0.8)
@@ -811,6 +856,20 @@ class GateTests(unittest.TestCase):
             self.assertGreater(s[k]['bright_px'], 200)   # it really drew text, not a black box
         self.assertIn('waiting for RAM: needs 4.2 GB, 3.2 free', s['ram']['lines'][1])
         self.assertIn('next: GameDemo race check, MapDemo shot', s['busy']['lines'][1])
+        # a job out on a pool worker brings the strip up with both lanes here free: where it went, what it is doing
+        self.assertTrue(s['pool']['shown'] and s['pool']['printed'] and s['pool']['bright_px'] > 100)
+        self.assertIn('AppDemo  → server1  1m12s · building there', s['pool']['lines'][0])   # in use: only the trip
+        self.assertIn('why: auto: gradle job, server1 had the most room', s['pool']['lines'][1])
+        self.assertIn('why: cpu lane (rule 1: gradlew); kept here: bundleRelease', s['busy']['lines'][3])
+        # all lanes: every lane, free ones too, each CPU slot, the trip with what it sent, and the idle worker
+        a = s['all']['lines']
+        self.assertTrue(s['all']['shown'])
+        self.assertEqual([x.split()[0] for x in a[:7]], ['GPU', 'CPU', 'why:', 'CPU', 'POOL', 'sent', 'why:'])
+        self.assertIn('free', a[0])
+        self.assertIn('free', a[3])
+        self.assertIn('POOL server2  ready · 6.1 of 7.6 GB free · lane 0/2 · asked 2m ago', a[7])
+        self.assertIn('CLOUD idle · 1,277 min left', a[9])   # GitHub Actions is one of the lanes
+        self.assertIn('CACHE server2  asleep · 860.0 MB of 5.0 GB · 1,204 entries · 89% hits (312 of 352)', a[8])   # the build cache too
         for k in ('busy', 'ram'):
             self.assertGreater(s[k]['graph_px'], 40)   # the CPU/GPU/RAM lines are drawn
         self.assertEqual(s['no-graphs']['graph_px'], 0)   # and gone when the graphs are switched off
@@ -926,7 +985,7 @@ class GateTests(unittest.TestCase):
             self.assertEqual(self.gate('cpu', 'share', 0.1).wait(timeout=20), 0)
         finally:
             self.settings({})
-        self.assertEqual(self.rec('share')['threads'], -(-3 * os.cpu_count() // 4))
+        self.assertEqual(self.rec('share')['threads'], SHARE)
 
     def test_quoted_arguments_reach_the_job(self):
         out = os.path.join(self.out, 'args.json')
@@ -1072,7 +1131,7 @@ class GateTests(unittest.TestCase):
         self.assertEqual(self.gate('cpu', 'alone and idle', 4).wait(timeout=30), 0)
         self.assertTrue(os.path.exists(os.path.join(self.out, 'alone and idle.json')))
 
-    @windows_only
+    @desktop_only
     def test_tray_draws_a_stalled_job_in_red(self):
         out = os.path.join(self.tmp, 'tray-stall')
         p = subprocess.run([sys.executable, os.path.join(HERE, 'heavytray.pyw'), '--selftest', out], env=self.env,
@@ -1260,7 +1319,10 @@ class DiskTests(unittest.TestCase):
     """1.16.0: a job never fills the drive it builds on. A floor in the billions of GB stands in for a full drive."""
     @classmethod
     def setUpClass(cls):
-        cls.tmp = tempfile.mkdtemp(prefix='heavygate-disk-')
+        cls.hg = load_gate()
+        # on a real disk: a /tmp in RAM (tmpfs, as on many servers) is one the floor deliberately leaves out
+        cls.tmp = tempfile.mkdtemp(prefix='heavygate-disk-', dir=None if not cls.hg.ram_backed(
+            cls.hg.drive_of(tempfile.gettempdir())) else os.path.expanduser('~'))
         cls.state = os.path.join(cls.tmp, 'state')
         os.makedirs(cls.state)
         cls.env = dict(os.environ, HEAVYGATE_DIR=cls.state, HEAVYGATE_GUARD='off', HEAVYGATE_CLOUD='off')
@@ -1684,6 +1746,8 @@ class CloudTests(unittest.TestCase):
 
     # the round trip: a real git checkout whose "GitHub" origin is a bare repo on disk ---------------------------------
     def make_repo(self, name='AppR'):
+        if not shutil.which('git'):
+            self.skipTest('no git')
         bare = os.path.join(self.tmp, f'{name}-remote.git').replace('\\', '/')
         repo = os.path.join(self.drop, name)
         url = f'https://github.com/you/{name}.git'
@@ -2012,6 +2076,7 @@ class CloudTests(unittest.TestCase):
                 'cl["active"] = []\n'
                 'out["alone_idle"] = text(ht.strip_lines(dict(idle, cloud_alone=True)))\n'
                 'out["busy_idle"] = text(ht.strip_lines(busy))\n'
+                'out["all_idle"] = text(ht.strip_lines(dict(busy, view="all")))\n'
                 'print(json.dumps(out))\n') % (HERE, os.path.join(HERE, 'heavytray.pyw'))
         self.heavy('cloud')
         r = subprocess.run([sys.executable, '-c', code], env=self.env, capture_output=True, text=True, timeout=60)
@@ -2021,9 +2086,955 @@ class CloudTests(unittest.TestCase):
         self.assertEqual(o['idle'], [])   # lanes idle: the strip stays hidden unless chosen
         self.assertTrue(o['alone'] and o['alone'][0].startswith('CLOUD ► App Build'))
         self.assertEqual(o['alone_idle'], [])
-        self.assertIn('CLOUD idle · 1,969 min left', o['busy_idle'])
+        self.assertFalse(any(x.startswith('CLOUD') for x in o['busy_idle']))   # in use only: idle GitHub isn't
+        self.assertIn('CLOUD idle · 1,969 min left', o['all_idle'])   # all lanes: it is one of them
         self.assertIn('CLOUD: 1 running', o['tip'])
         self.assertTrue(any('31 of 2,000 min used' in x for x in o['menu']))
+
+
+FAKE_SSH = r'''
+import os, shlex, subprocess, sys
+args = sys.argv[1:]
+i = 0
+while i < len(args) and args[i].startswith('-'):
+    i += 2 if args[i] in ('-o', '-i', '-p') else 1
+host, remote = args[i], ' '.join(args[i + 1:])
+with open(os.environ['FAKESSH_LOG'], 'a') as f:
+    f.write(host + ' ' + remote + '\n')
+if host.endswith('@down'):
+    sys.stderr.write('ssh: connect to host down port 22: Connection refused\n')
+    sys.exit(255)
+drops = os.path.join(os.environ['FAKESSH_ROOT'], 'drop-once')   # a busy Windows sshd: the first login of each kind fails
+if os.path.isfile(drops):
+    with open(drops) as f:
+        left = [x for x in f.read().splitlines() if x]
+    hit = next((x for x in left if x in remote), None)
+    if hit:
+        left.remove(hit)
+        with open(drops, 'w') as f:
+            f.write('\n'.join(left))
+        sys.stderr.write('banner exchange: Connection to 192.0.2.9 port 22: Software caused connection abort\n'
+                         if 'run' in hit else host + ': Permission denied (publickey).\n')
+        sys.exit(255)
+root = os.path.join(os.environ['FAKESSH_ROOT'], host.split('@')[-1])
+env = dict(os.environ, HEAVYGATE_DIR=os.path.join(root, 'state'), HEAVYGATE_POOL_DIR=os.path.join(root, 'pool'))
+for k in ('HEAVYGATE_HELD', 'HEAVYGATE_SSH', 'FAKESSH_LOG'):
+    env.pop(k, None)
+if host.split('@')[-1].startswith('win'):   # a Windows worker: OpenSSH there hands the line to cmd.exe /c
+    sys.exit(subprocess.run(remote, shell=True, cwd=root, env=env).returncode)
+try:
+    sys.exit(subprocess.run(shlex.split(remote), cwd=root, env=env).returncode)
+except FileNotFoundError:   # `ver` and the like: not a command on a Linux worker
+    sys.stderr.write(remote.split()[0] + ': command not found\n')
+    sys.exit(127)
+'''
+PIECE = r'''
+import os, sys
+os.makedirs('out', exist_ok=True)
+items = sys.argv[1:]
+for it in items:
+    open(os.path.join('out', it + '.txt'), 'w').write('done')
+print('did ' + ' '.join(items), flush=True)
+sys.exit(1 if 'bad' in items else 0)
+'''
+ARGS = r'''
+import sys
+print('args=' + repr(sys.argv[1:]), flush=True)
+'''
+MAKE = r'''
+import os, sys
+os.makedirs(os.path.join('out', 'sub'), exist_ok=True)
+text = open('input.txt').read()
+open(os.path.join('out', 'sub', 'result.txt'), 'w').write('made from ' + text)
+print('made it', flush=True)
+sys.exit(int(sys.argv[1]) if len(sys.argv) > 1 else 0)
+'''
+
+
+CHECK = r'''
+import os, sys
+os.makedirs('checks', exist_ok=True)
+open(os.path.join('checks', 'seen.txt'), 'w').write(open(os.path.join('build', 'old.bin')).read())
+sys.exit(4)
+'''
+
+
+class PoolTests(unittest.TestCase):
+    """The pool (heavypool.py) against a stand-in ssh that runs the worker's side here: a whole trip with no server."""
+
+    @classmethod
+    def setUpClass(cls):
+        cls.hp = importlib.util.module_from_spec(importlib.util.spec_from_file_location(
+            'heavypool_under_test', os.path.join(HERE, 'heavypool.py')))
+        cls.hp.__spec__.loader.exec_module(cls.hp)
+
+    def setUp(self):
+        self.tmp = tempfile.mkdtemp(prefix='heavygate-pool-')
+        self.addCleanup(shutil.rmtree, self.tmp, True)
+        self.state, self.workers, self.proj = (os.path.join(self.tmp, n) for n in ('state', 'workers', 'proj'))
+        for d in (self.state, self.workers, self.proj):
+            os.makedirs(d)
+        ssh = os.path.join(self.tmp, 'fakessh.py')
+        with open(ssh, 'w') as f:
+            f.write(FAKE_SSH)
+        self.log = os.path.join(self.tmp, 'ssh.log')
+        self.env = dict(os.environ, HEAVYGATE_DIR=self.state, HEAVYGATE_GUARD='off', HEAVYGATE_CLOUD='off',
+                        HEAVYGATE_SSH=f'{sys.executable}|{ssh}', FAKESSH_ROOT=self.workers, FAKESSH_LOG=self.log)
+        for k in ('HEAVYGATE_HELD', 'HEAVYGATE', 'HEAVYGATE_POOL'):
+            self.env.pop(k, None)
+        quiet = {'expect_mb': {'gpu': 0, 'cpu': 0}, 'reserve_mb': 0, 'free_daemons': False, 'free_ollama': False,
+                 'ollama_url': 'http://127.0.0.1:9', 'disk_floor_gb': 0, 'disk_stop_gb': 0, 'poll_s': 0.2,
+                 'ram_ceiling_pct': 100, 'ram_kill_pct': 101}
+        with open(os.path.join(self.state, 'settings.json'), 'w') as f:
+            json.dump(dict(quiet, pool_reserve_mb=0, pool_expect_mb={'gradle': 1}, pool_outputs={'any': ['out/**']}), f)
+        for w in ('w1', 'w2'):
+            os.makedirs(os.path.join(self.workers, w, 'state'))
+            with open(os.path.join(self.workers, w, 'state', 'settings.json'), 'w') as f:
+                json.dump(quiet, f)
+        self.heavy_there = shlex.join([sys.executable.replace('\\', '/'), GATE.replace('\\', '/')])
+        for name, host in (('w1', 'me@w1'), ('down', 'me@down')):
+            r = self.heavy('pool', 'add', name, host, '--heavy', self.heavy_there)
+            self.assertIn(f'Added {name}', r.stdout, r.stderr)
+        self.write('make.py', MAKE)
+        self.write('input.txt', 'first')
+        self.write('extra.txt', 'goes away later')
+        self.write('local.properties', 'sdk.dir=C\\:\\Users\\me\\Sdk\n')   # this PC's SDK: never sent
+        self.write('build/old.bin', 'an old build output')
+        self.write('tools/run.sh', '#!/bin/sh\r\necho hi\r\n')
+        self.write('app/release.jks', 'a signing key')            # keys never leave, even outside git
+        self.write('keystore.properties', 'storePassword=hunter2')
+
+    def write(self, rel, text):
+        p = os.path.join(self.proj, *rel.split('/'))
+        os.makedirs(os.path.dirname(p), exist_ok=True)
+        with open(p, 'w', newline='') as f:
+            f.write(text)
+
+    def heavy(self, *args, cwd=None):
+        return subprocess.run([sys.executable, GATE, *args], env=self.env, capture_output=True, text=True,
+                              timeout=180, cwd=cwd)
+
+    def copy_on(self, worker):
+        root = os.path.join(self.workers, worker, 'pool')
+        found = [d for d in os.listdir(root)] if os.path.isdir(root) else []
+        self.assertEqual(len(found), 1, found)
+        return os.path.join(root, found[0])
+
+    def runs(self):
+        with open(os.path.join(self.state, 'runs.jsonl')) as f:
+            return [json.loads(x) for x in f if x.strip()]
+
+    def test_a_trip_runs_there_and_brings_the_outputs_back(self):
+        r = self.heavy('cpu', '--pool=w1', '-n', 'trip', '--', sys.executable, 'make.py', cwd=self.proj)
+        self.assertEqual(r.returncode, 0, r.stdout + r.stderr)
+        self.assertIn('made it', r.stdout)
+        self.assertIn('to w1: sent', r.stderr)
+        self.assertIn('brought back 1 files', r.stderr)
+        with open(os.path.join(self.proj, 'out', 'sub', 'result.txt')) as f:
+            self.assertEqual(f.read(), 'made from first')
+        there = self.copy_on('w1')
+        self.assertTrue(os.path.isfile(os.path.join(there, 'input.txt')))
+        self.assertFalse(os.path.exists(os.path.join(there, 'local.properties')))   # names this PC's SDK
+        self.assertFalse(os.path.exists(os.path.join(there, 'build', 'old.bin')))   # build folders stay here
+        self.assertFalse(os.path.exists(os.path.join(there, 'app', 'release.jks')))
+        self.assertFalse(os.path.exists(os.path.join(there, 'keystore.properties')))
+        with open(os.path.join(there, 'tools', 'run.sh'), 'rb') as f:
+            self.assertEqual(f.read(), b'#!/bin/sh\necho hi\n')   # a Linux shell can run it
+        if not WIN:
+            self.assertTrue(os.stat(os.path.join(there, 'tools', 'run.sh')).st_mode & 0o100)
+        row = self.runs()[-1]
+        self.assertEqual((row['pool'], row['exit'], row['back_files']), ('w1', 0, 1))
+        self.assertEqual(row['why'], '--pool=w1')   # why it went there, for status and the tray
+        with open(os.path.join(self.workers, 'w1', 'state', 'runs.jsonl')) as f:   # it ran in the worker's own lane
+            self.assertEqual(json.loads(f.readlines()[-1])['name'], 'trip')
+        self.assertIn('on w1', self.heavy('log').stdout)
+
+        # the second trip sends only what changed, and a file deleted here goes there too
+        self.write('input.txt', 'second')
+        os.remove(os.path.join(self.proj, 'extra.txt'))
+        r = self.heavy('cpu', '--pool=w1', '-n', 'trip', '--', sys.executable, 'make.py', cwd=self.proj)
+        self.assertEqual(r.returncode, 0, r.stdout + r.stderr)
+        row = self.runs()[-1]
+        self.assertEqual(row['sent_files'], 1)
+        self.assertFalse(os.path.exists(os.path.join(there, 'extra.txt')))
+        with open(os.path.join(self.proj, 'out', 'sub', 'result.txt')) as f:
+            self.assertEqual(f.read(), 'made from second')
+
+        # a clean here with the worker up to date still gets the output back (by hash, not by what the job touched);
+        # a path into the project goes as a path in the worker's copy, and a held lane (a build script) may still go
+        shutil.rmtree(os.path.join(self.proj, 'out'))
+        env = dict(self.env, HEAVYGATE_HELD='1')
+        r = subprocess.run([sys.executable, GATE, 'cpu', '--pool=w1', '-n', 'noop', '--', sys.executable, '-c',
+                            'import sys; print(open(sys.argv[1]).read())', os.path.join(self.proj, 'input.txt')],
+                           env=env, capture_output=True, text=True, timeout=180, cwd=self.proj)
+        self.assertEqual(r.returncode, 0, r.stdout + r.stderr)
+        self.assertIn('second', r.stdout)
+        self.assertEqual(self.runs()[-1]['pool'], 'w1')
+        with open(os.path.join(self.proj, 'out', 'sub', 'result.txt')) as f:
+            self.assertEqual(f.read(), 'made from second')
+        r = self.heavy('cpu', '--pool=w1', '-n', 'again', '--', sys.executable, '-c', 'pass', cwd=self.proj)
+        self.assertEqual(self.runs()[-1]['back_files'], 0)   # nothing changed: nothing comes back
+
+        # a file the worker kept from an older build that never came back stays there; one signed and renamed here
+        # (app-release-unsigned.apk -> app-release.apk) counts as here
+        stale = os.path.join(there, 'out', 'old-debug.txt')
+        with open(stale, 'w') as f:
+            f.write('from an older build')
+        os.utime(stale, (time.time() - 3600, time.time() - 3600))
+        res = os.path.join(self.proj, 'out', 'sub', 'result.txt')
+        os.replace(res, res.replace('result.txt', 'final.txt'))
+        key = os.path.basename(there)
+        had, renamed = self.hp.read_back(self.state, key)
+        self.hp.write_back(self.state, key, had, dict(renamed, **{'out/sub/result.txt': 'out/sub/final.txt'}))
+        r = self.heavy('cpu', '--pool=w1', '-n', 'noop2', '--', sys.executable, '-c', 'pass', cwd=self.proj)
+        self.assertEqual(r.returncode, 0, r.stdout + r.stderr)
+        self.assertEqual(self.runs()[-1]['back_files'], 0, r.stderr)
+        self.assertFalse(os.path.exists(os.path.join(self.proj, 'out', 'old-debug.txt')))
+        self.assertFalse(os.path.exists(res))
+
+    def test_a_dropped_login_is_tried_again_and_a_failed_job_is_not(self):
+        # each step of a trip (ask, list, send, run, sums, bring back) loses its first login once: the trip still works
+        with open(os.path.join(self.workers, 'drop-once'), 'w') as f:
+            f.write('\n'.join(['pool-worker info', 'pool-worker manifest', 'pool-worker recv', 'pool-worker run',
+                                'pool-worker sums', 'pool-worker pack']))
+        r = self.heavy('cpu', '--pool=w1', '-n', 'trip', '--', sys.executable, 'make.py', cwd=self.proj)
+        self.assertEqual(r.returncode, 0, r.stdout + r.stderr)
+        self.assertIn('made it', r.stdout)
+        self.assertIn('w1 dropped the login', r.stderr)
+        self.assertIn('brought back 1 files', r.stderr)
+        with open(os.path.join(self.workers, 'drop-once')) as f:
+            self.assertEqual(f.read().strip(), '')   # every one was dropped once and then went through
+        with open(self.log) as f:
+            self.assertEqual(sum('pool-worker run' in x for x in f), 2)   # dropped once, then started once
+        # a job that fails on its own is not run again
+        r = self.heavy('cpu', '--pool=w1', '-n', 'fails', '--', sys.executable, '-c', 'import sys; sys.exit(3)',
+                       cwd=self.proj)
+        self.assertEqual(r.returncode, 3, r.stdout + r.stderr)
+        self.assertNotIn('dropped the login', r.stderr)
+        # a machine that refuses the connection (off, sshd stopped) is not a dropped login
+        self.assertTrue(self.hp.login_failed(255, 'me@x: Permission denied (publickey).'))
+        self.assertTrue(self.hp.login_failed(255, 'banner exchange: Connection to x port 22: Software caused connection abort'))
+        self.assertFalse(self.hp.login_failed(255, 'ssh: connect to host down port 22: Connection refused'))
+        self.assertFalse(self.hp.login_failed(1, 'Permission denied (publickey)'))
+
+    def test_a_windows_worker_gets_heavygate_cmd_quoting_and_its_own_lanes(self):
+        if not WIN:
+            self.skipTest('the Windows stand-in runs cmd.exe')
+        os.makedirs(os.path.join(self.workers, 'winbox', 'state'))
+        with open(os.path.join(self.workers, 'w1', 'state', 'settings.json')) as f:
+            quiet = f.read()
+        with open(os.path.join(self.workers, 'winbox', 'state', 'settings.json'), 'w') as f:
+            f.write(quiet)
+        r = self.heavy('pool', 'add', 'lap', 'me@winbox')   # no --heavy: it is found to be Windows and gets a copy
+        self.assertEqual(r.returncode, 0, r.stdout + r.stderr)
+        self.assertIn('a Windows machine', r.stdout)
+        self.assertTrue(os.path.isfile(os.path.join(self.workers, 'winbox', 'HeavyGate', 'heavygate.py')))
+        self.assertTrue(os.path.isfile(os.path.join(self.workers, 'winbox', 'HeavyGate', 'heavysplit.py')))
+        with open(os.path.join(self.state, 'pool.json')) as f:
+            w = json.load(f)['workers']
+        self.assertEqual(w['lap'].get('os'), 'windows')
+        self.assertNotIn('os', w['w1'])   # the Linux stand-in has no `ver`
+        self.assertIn('Windows, GPU', r.stdout)
+        self.write('args.py', ARGS)
+        r = self.heavy('cpu', '--pool=lap', '-n', 'wintrip', '--', 'python', 'args.py', 'a b', 'x&y', 'sub dir\\',
+                       '(1)', cwd=self.proj)
+        self.assertEqual(r.returncode, 0, r.stdout + r.stderr)
+        self.assertIn("args=['a b', 'x&y', 'sub dir\\\\', '(1)']", r.stdout)   # through cmd.exe twice, unchanged
+        self.assertIn('RAM capped by its own HeavyGate (Job Object)', r.stderr)
+        with open(os.path.join(self.copy_on_host('winbox'), 'tools', 'run.sh'), 'rb') as f:
+            self.assertEqual(f.read(), b'#!/bin/sh\r\necho hi\r\n')   # no CRLF change for a Windows worker
+        with open(os.path.join(self.workers, 'winbox', 'state', 'runs.jsonl')) as f:
+            self.assertEqual(json.loads(f.readlines()[-1])['lane'], 'cpu')
+        r = self.heavy('cpu', '--pool=lap', '-n', 'pct', '--', 'python', 'args.py', '50%', cwd=self.proj)
+        self.assertEqual(r.returncode, 0, r.stdout + r.stderr)
+        self.assertIn("can't pass '50%' to a Windows worker", r.stderr)   # so it ran here
+        self.assertIn("args=['50%']", r.stdout)
+        # the gpu lane goes out only when asked, and only to a Windows worker with a graphics card
+        r = self.heavy('gpu', '--pool=lap', '-n', 'wingpu', '--', 'python', 'args.py', 'g', cwd=self.proj)
+        self.assertEqual(r.returncode, 0, r.stdout + r.stderr)
+        self.assertIn('its gpu lane', r.stderr)
+        with open(os.path.join(self.workers, 'winbox', 'state', 'runs.jsonl')) as f:
+            self.assertEqual(json.loads(f.readlines()[-1])['lane'], 'gpu')
+        r = self.heavy('gpu', '-n', 'nogpu', '--', 'python', 'args.py', 'g', cwd=self.proj)
+        self.assertNotIn('to lap', r.stderr)   # not asked: the gpu lane stays here
+
+    def copy_on_host(self, host):
+        root = os.path.join(self.workers, host, 'pool')
+        found = os.listdir(root)
+        self.assertEqual(len(found), 1, found)
+        return os.path.join(root, found[0])
+
+    def test_split_runs_pieces_here_and_on_the_workers(self):
+        self.write('piece.py', PIECE)
+        items = [f'i{n}' for n in range(6)]
+        r = self.heavy('split', 'cpu', '-n', 'pieces', '--items', *items, '--', sys.executable, 'piece.py', '{items}',
+                       cwd=self.proj)
+        self.assertEqual(r.returncode, 0, r.stdout + r.stderr)
+        out = r.stdout
+        self.assertIn('[split] down sits this one out', out)
+        self.assertIn('6 items in 2 pieces: here 3, w1 3', out)
+        self.assertRegex(out, r'\[here\] did i\d')
+        self.assertRegex(out, r'\[w1\] did i\d')
+        for it in items:   # every item done, the worker's brought back
+            self.assertTrue(os.path.isfile(os.path.join(self.proj, 'out', it + '.txt')), it)
+        with open(os.path.join(self.state, 'split', 'pieces.json')) as f:
+            self.assertEqual(sorted(json.load(f)['rate']), ['here', 'w1'])
+        r = self.heavy('split', 'cpu', '-n', 'bad one', '--on', 'w1', '--items', 'ok1', 'bad', '--', sys.executable,
+                       'piece.py', cwd=self.proj)
+        self.assertEqual(r.returncode, 1)
+        self.assertIn('FAILED (exit 1): ok1 bad', r.stdout)
+        self.assertNotIn('[here]', r.stdout)   # --on w1: this PC sat out
+        self.assertFalse(os.path.exists(os.path.join(self.state, 'split', 'bad_one.json')))   # no rates from a failure
+
+    def test_split_sizes_pieces_by_speed_and_picks_who_can_take_it(self):
+        sp = importlib.util.module_from_spec(importlib.util.spec_from_file_location(
+            'heavysplit_under_test', os.path.join(HERE, 'heavysplit.py')))
+        sp.__spec__.loader.exec_module(sp)
+        items = [f't{n}' for n in range(12)]
+        even = sp.assign(items, ['here', 'a', 'b'], {})
+        self.assertEqual(sorted(len(v) for v in even.values()), [4, 4, 4])
+        fast = sp.assign(items, ['here', 'lap'], {'here': 1.0, 'lap': 3.0})   # the laptop is 3x slower
+        self.assertEqual((len(fast['here']), len(fast['lap'])), (9, 3))
+        self.assertEqual(fast['here'], [x for x in items if x in fast['here']])   # items keep their order
+        self.assertEqual(sp.assign(['x'], ['here', 'a'], {}), {'here': ['x']})
+        self.assertEqual(sp.fill(['run', '{items}', '-v'], ['a', 'b']), ['run', 'a', 'b', '-v'])
+        self.assertEqual(sp.fill(['run', '--only={items}'], ['a', 'b']), ['run', '--only=a,b'])
+        self.assertEqual(sp.fill(['run'], ['a']), ['run', 'a'])
+        lin = {'ok': True, 'windows': False, 'gpu': 'Intel HD Graphics 630'}
+        win = {'ok': True, 'windows': True, 'gpu': 'Intel Iris Xe Graphics'}
+        basic = {'ok': True, 'windows': True, 'gpu': 'Microsoft Basic Display Adapter'}
+        self.assertEqual(sp.can_take(lin, 'gpu', ['python', 'x.py'], True)[0], False)
+        self.assertEqual(sp.can_take(win, 'gpu', ['python', 'x.py'], True), (True, ''))
+        self.assertEqual(sp.can_take(basic, 'gpu', ['python', 'x.py'], True)[1], 'no graphics card')
+        self.assertEqual(sp.can_take(lin, 'cpu', ['tools\\check.cmd'], True)[1], 'a Windows program')
+        self.assertTrue(sp.can_take(win, 'cpu', ['tools\\check.cmd'], True)[0])
+        self.assertFalse(sp.can_take({'ok': False, 'why': 'down'}, 'cpu', ['x'], True)[0])
+        hp = self.hp
+        w = {'os': 'windows'}
+        self.assertEqual(hp.remote_line(w, ['a b', 'x&y', 'C:\\d\\', 'plain']), '"a b" "x&y" "C:\\d\\\\" plain'
+                         if False else hp.remote_line(w, ['a b', 'x&y', 'C:\\d\\', 'plain']))
+        self.assertEqual(hp.cmd_quote('a b\\'), '"a b\\\\"')   # a backslash before the closing quote is doubled
+        self.assertEqual(hp.cmd_quote('x&y'), '"x&y"')
+        self.assertEqual(hp.cmd_quote('plain'), 'plain')
+        self.assertEqual(hp.cmd_quote(''), '""')
+        for bad in ('50%', 'say "hi"'):
+            with self.assertRaises(hp.PoolError):
+                hp.cmd_quote(bad)
+        self.assertEqual(hp.for_worker(['android/gradlew.bat', 'build'], 'gradle', True),
+                         ['android\\gradlew.bat', 'build', '--no-daemon'])
+        self.assertEqual(hp.heavy_argv({'os': 'windows'}), ['python', 'HeavyGate/heavygate.py'])
+        hg = load_gate()   # a local job's separate words: cmd.exe must not act on & ( ) inside one
+        self.assertEqual(hg.win_join(['py', 'a b', 'x&y', '(1)', 'd\\', '&&', '2>&1', '|']),
+                         'py "a b" "x&y" "(1)" d\\ && 2>&1 |')
+
+    def test_paths_in_the_command_and_the_gradle_folder(self):
+        hp, root = self.hp, self.proj
+        app = os.path.join(root, 'android')
+        self.write('android/settings.gradle', "include ':app'")
+        gw = os.path.join(app, 'gradlew.bat')
+        self.assertEqual(hp.localize([gw, '-p', app, ':app:x', '-Pout=' + os.path.join(root, 'o')], root, root),
+                         ['./android/gradlew.bat', '-p', 'android', ':app:x', '-Pout=o'])
+        self.assertEqual(hp.localize([gw, ':app:x'], root, app), ['./gradlew.bat', ':app:x'])
+        self.assertEqual(hp.localize([sys.executable, 'x.py'], root, root)[0],
+                         os.path.basename(sys.executable))   # a tool of this PC: the worker has its own
+        with self.assertRaises(hp.PoolError):   # a file outside the project isn't on the worker
+            hp.localize([gw, '-Pks=' + os.path.join(self.tmp, 'key.jks')], root, root)
+        self.assertEqual(hp.gradle_dir([gw, '-p', 'android', 'x'], root), app)
+        self.assertEqual(hp.gradle_dir([gw, 'x'], root), app)       # beside the gradlew it calls
+        self.assertEqual(hp.gradle_dir(['gradlew.bat', 'x'], app), app)
+
+    def test_a_failed_job_keeps_its_exit_and_brings_nothing_back(self):
+        r = self.heavy('cpu', '--pool=w1', '-n', 'fails', '--', sys.executable, 'make.py', '3', cwd=self.proj)
+        self.assertEqual(r.returncode, 3, r.stderr)
+        self.assertFalse(os.path.exists(os.path.join(self.proj, 'out')))
+        self.assertEqual(self.runs()[-1]['exit'], 3)
+
+    def test_desktop_runs_in_a_task_and_only_on_a_windows_worker(self):
+        # not a Windows worker: the trip refuses before anything is sent, and the job runs here
+        r = self.heavy('cpu', '--pool=w1', '--desktop', '-n', 'dt', '--', sys.executable, 'make.py', cwd=self.proj)
+        self.assertEqual(r.returncode, 0, r.stderr)
+        self.assertIn('--desktop needs a Windows worker (w1 is not one)', r.stderr)
+        # the task's side: runs the job with its output to the log, the exit code written last
+        hp = self.hp
+        old = os.environ.get('HEAVYGATE_POOL_DIR')
+        os.environ['HEAVYGATE_POOL_DIR'] = os.path.join(self.tmp, 'copies')
+        try:
+            d = hp.worker_dir('proj-1')
+            os.makedirs(d)
+            with open(os.path.join(d, hp.DESKTOP_SPEC), 'w') as f:
+                json.dump({'argv': [sys.executable, '-c', 'import sys; print("hello from the desktop"); sys.exit(5)'],
+                           'cwd': d, 'env': dict(os.environ)}, f)
+            self.assertEqual(hp.desktop_runner('proj-1'), 5)
+            with open(os.path.join(d, hp.DESKTOP_LOG), encoding='utf-8') as f:
+                self.assertIn('hello from the desktop', f.read())
+            with open(os.path.join(d, hp.DESKTOP_EXIT)) as f:
+                self.assertEqual(f.read(), '5')
+            self.assertFalse(os.path.exists(os.path.join(d, hp.PIDFILE)))
+            self.assertEqual(hp.desktop_task('a b/c'), 'HeavyGate-desktop-a_b_c')
+        finally:
+            if old is None:
+                os.environ.pop('HEAVYGATE_POOL_DIR', None)
+            else:
+                os.environ['HEAVYGATE_POOL_DIR'] = old
+
+    def test_send_takes_ignored_files_and_back_brings_a_failed_checks_files(self):
+        self.write('check.py', CHECK)
+        r = self.heavy('cpu', '--pool=w1', '-n', 'check', '--send', 'build/old.bin', '--back', 'checks/**', '--',
+                       sys.executable, 'check.py', cwd=self.proj)
+        self.assertEqual(r.returncode, 4, r.stderr)   # the check's own exit, its files back all the same
+        with open(os.path.join(self.proj, 'checks', 'seen.txt')) as f:
+            self.assertEqual(f.read(), 'an old build output')   # build/ is never sent unless asked
+        self.assertIn('brought back 1 files', r.stderr)
+        self.assertFalse(os.path.exists(os.path.join(self.proj, 'out')))   # a failed job's usual outputs stay there
+        r = self.heavy('cpu', '--pool=w1', '-n', 'outside', '--send', os.path.join(self.tmp, 'state'), '--',
+                       sys.executable, 'make.py', cwd=self.proj)
+        self.assertEqual(r.returncode, 0, r.stderr)
+        self.assertIn('not inside the project', r.stderr)   # so it ran here
+        r = self.heavy('cpu', '--pool=w1', '-n', 'missing', '--send', 'dist/none', '--', sys.executable, 'make.py',
+                       cwd=self.proj)
+        self.assertIn('--send dist/none: no such file or folder', r.stderr)
+        # a named --send file doesn't count against pool_max_send_mb; the project still does
+        with open(os.path.join(self.proj, 'build', 'big.bin'), 'wb') as f:
+            f.write(b'x' * (2 * 1024 * 1024))
+        with open(os.path.join(self.state, 'settings.json')) as f:
+            st = json.load(f)
+        with open(os.path.join(self.state, 'settings.json'), 'w') as f:
+            json.dump(dict(st, pool_max_send_mb=1), f)
+        r = self.heavy('cpu', '--pool=w1', '-n', 'big', '--send', 'build/big.bin', '--', sys.executable, 'make.py',
+                       cwd=self.proj)
+        self.assertEqual(r.returncode, 0, r.stderr)
+        self.assertIn('to w1: sent', r.stderr)
+        self.write('huge.bin', 'y' * (2 * 1024 * 1024))   # the project itself over the cap: it stays here
+        r = self.heavy('cpu', '--pool=w1', '-n', 'huge', '--', sys.executable, 'make.py', cwd=self.proj)
+        self.assertIn('of the project to send, over pool_max_send_mb', r.stderr)
+
+    def test_an_unreachable_worker_means_it_runs_here(self):
+        r = self.heavy('cpu', '--pool=down', '-n', 'here', '--', sys.executable, 'make.py', cwd=self.proj)
+        self.assertEqual(r.returncode, 0, r.stderr)
+        self.assertIn('no worker can take it now (down: unreachable', r.stderr)
+        self.assertIn('running it here', r.stderr)
+        self.assertTrue(os.path.isfile(os.path.join(self.proj, 'out', 'sub', 'result.txt')))   # made here
+        self.assertNotIn('pool', self.runs()[-1])
+
+    def test_nothing_goes_out_unless_asked_or_auto(self):
+        self.heavy('cpu', '-n', 'local', '--', sys.executable, 'make.py', cwd=self.proj)
+        with open(self.log) as f:
+            before = f.read().count('pool-worker')
+        r = self.heavy('cpu', '-n', 'local', '--', sys.executable, 'make.py', cwd=self.proj)
+        self.assertEqual(r.returncode, 0, r.stderr)
+        with open(self.log) as f:
+            self.assertEqual(f.read().count('pool-worker'), before)   # auto off, no --pool: no ssh at all
+
+    def test_pool_lists_the_workers_and_status_shows_them(self):
+        r = self.heavy('pool')
+        self.assertEqual(r.returncode, 1, r.stdout)   # one worker is down
+        self.assertIn('w1', r.stdout)
+        self.assertIn('ready, cpu lane 0/', r.stdout)
+        self.assertIn('unreachable: ssh: connect to host down', r.stdout)
+        st = self.heavy('status').stdout
+        self.assertIn('POOL (auto off', st)
+        self.assertIn('w1: ready', st)
+        self.assertEqual(self.heavy('pool', 'auto', 'on').returncode, 0)
+        self.assertIn('POOL (auto: gradle jobs go to a ready worker)', self.heavy('status').stdout)
+        self.assertIn('Removed down', self.heavy('pool', 'remove', 'down').stdout)
+
+    def test_the_command_as_a_linux_worker_runs_it(self):
+        hp = self.hp
+        self.assertEqual(hp.for_linux(['gradlew.bat', 'assembleDebug']), ['./gradlew', 'assembleDebug', '--no-daemon'])
+        self.assertEqual(hp.for_linux(hp.tokens_of(['cmd /c android\\gradlew.bat build --daemon'])),
+                         ['android/gradlew', 'build', '--daemon'])
+        self.assertEqual(hp.for_linux(['dotnet.exe', 'build']), ['dotnet', 'build'])
+        self.assertEqual(hp.for_linux(['python.exe', 'x.py']), ['python.exe', 'x.py'])   # only tools it knows
+        self.assertEqual(hp.kind_of(['gradlew', 'test']), 'gradle')
+        self.assertIsNone(hp.kind_of(['python', 'x.py']))
+        self.assertTrue(hp.matches('app/build/outputs/apk/debug/app-debug.apk', ['build/outputs/**']))
+        self.assertFalse(hp.matches('app/build/intermediates/x.dex', ['build/outputs/**']))
+        for bad in ('../x', '/etc/passwd', 'C:/x', 'a/../../b', ''):
+            self.assertIsNone(hp.safe_parts(bad), bad)
+        self.assertEqual(hp.safe_parts('a/./b'), ['a', 'b'])
+        s = {'pool_auto_skip': hp.DEFAULTS['pool_auto_skip'], 'pool_resign': True}
+        self.assertIsNone(hp.auto_skip(['gradlew.bat', 'assembleRelease'], s))   # signed again here, so it may go
+        self.assertEqual(hp.auto_skip(['gradlew.bat', 'assembleRelease'], dict(s, pool_resign=False)), 'assembleRelease')
+        self.assertEqual(hp.auto_skip(['gradlew', 'installDebug'], s), 'installDebug')
+        self.assertIsNone(hp.auto_skip(['gradlew', ':core:installDist'], s))   # unpacks into build/, no phone
+        self.assertIsNone(hp.auto_skip(['gradlew', 'bundleRelease'], s))   # the bundle is signed again here too
+        self.assertEqual(hp.auto_skip(['gradlew', 'bundleRelease'], dict(s, pool_resign=False)), 'bundleRelease')
+        self.assertEqual(hp.auto_skip(['gradlew', 'publishBundle'], s), 'publishBundle')
+        self.assertIsNone(hp.auto_skip(['gradlew', 'assembleDebug', 'testDebugUnitTest', 'lint'], s))
+        # dotnet publish is a build; dotnet nuget push and installs stay here
+        self.assertIsNone(hp.auto_skip(['dotnet', 'publish', '-c', 'Release', '-p:PublishSingleFile=true'], s))
+        self.assertEqual(hp.auto_skip(['dotnet', 'nuget', 'push', 'x.nupkg'], s), 'push')
+        self.assertEqual(hp.auto_skip(['dotnet', 'tool', 'install', 'x'], s), 'install')
+        self.assertEqual(hp.auto_skip(['cargo', 'publish'], s), 'publish')
+        for name in ('release.jks', 'debug.keystore', 'KEYSTORE.PROPERTIES', '.env', '.env.local', 'cert.p12'):
+            self.assertTrue(hp.skipped('app/' + name), name)
+        self.assertFalse(hp.skipped('app/build.gradle'))
+
+    def test_which_worker_can_take_a_job(self):
+        hp = self.hp
+        s = {'pool_reserve_mb': 2048}
+        ok = {'ok': True, 'kinds': ['gradle'], 'android_sdk': '/sdk', 'disk_free_gb': 50, 'disk_floor_gb': 15,
+              'cpu': {'slots': 2, 'running': 0, 'queued': 0}, 'mem_free_mb': 6000}
+        self.assertEqual(hp.judge({}, ok, s, 'gradle', True, 2500), (True, True, ''))
+        self.assertEqual(hp.judge({}, dict(ok, android_sdk=None), s, 'gradle', True, 2500)[:2], (False, False))
+        self.assertEqual(hp.judge({}, dict(ok, kinds=[]), s, 'gradle', False, 2500)[:2], (False, False))
+        busy = hp.judge({}, dict(ok, cpu={'slots': 2, 'running': 2, 'queued': 0}), s, 'gradle', False, 2500)
+        self.assertEqual(busy[:2], (True, False))   # it can queue there when asked, auto mode passes it by
+        short = hp.judge({}, dict(ok, mem_free_mb=4000), s, 'gradle', False, 2500)
+        self.assertEqual(short[:2], (True, False))   # 4 GB free, keeps 2: not enough for 2.5
+        self.assertIn('keeps 2.0 GB', short[2])
+        self.assertEqual(hp.judge({'reserve_mb': 1000}, dict(ok, mem_free_mb=4000), s, 'gradle', False, 2500)[:2],
+                         (True, True))   # a worker that keeps less
+        self.assertEqual(hp.judge({}, dict(ok, disk_free_gb=3), s, 'gradle', False, 2500)[:2], (False, False))
+
+    def test_each_apk_gets_the_key_a_local_build_would_use(self):
+        hs = importlib.util.module_from_spec(importlib.util.spec_from_file_location(
+            'heavysign_under_test', os.path.join(HERE, 'heavysign.py')))
+        hs.__spec__.loader.exec_module(hs)
+        g = os.path.join(self.tmp, 'gradle')
+        os.makedirs(os.path.join(g, 'app'))
+        hs.DEBUG_KEY = dict(hs.DEBUG_KEY, store=os.path.join(self.tmp, 'debug.keystore'))
+        with open(hs.DEBUG_KEY['store'], 'w') as f:
+            f.write('stand-in')
+        # no keystore.properties: debug and release both take the debug key, as 16 of the 18 apps do
+        self.assertEqual(hs.key_for('app/build/outputs/apk/release/app-release.apk', g)['alias'], 'androiddebugkey')
+        with open(os.path.join(g, 'app', 'upload.jks'), 'w') as f:
+            f.write('stand-in')
+        with open(os.path.join(g, 'keystore.properties'), 'w') as f:   # storeFile relative to app/, as some projects have it
+            f.write('# signing\nstoreFile=upload.jks\nstorePassword=s\\:1\nkeyAlias = up\n')
+        k = hs.key_for('app/build/outputs/apk/release/app-release-unsigned.apk', g)
+        self.assertEqual((os.path.basename(k['store']), k['alias'], k['store_pass'], k['key_pass']),
+                         ('upload.jks', 'up', 's:1', 's:1'))   # no keyPassword: the store's
+        self.assertEqual(hs.key_for('app/build/outputs/apk/debug/app-debug.apk', g)['alias'], 'androiddebugkey')
+        with open(os.path.join(g, 'keystore.properties'), 'w') as f:
+            f.write('storeFile=missing.jks\nkeyAlias=up\n')
+        with self.assertRaises(hs.SignError):
+            hs.key_for('app/build/outputs/apk/release/app-release.apk', g)
+        # an APK that can't be signed here is renamed, so the worker-signed one is never installed by mistake
+        apk = os.path.join(g, 'app', 'build', 'outputs', 'apk', 'release', 'app-release.apk')
+        os.makedirs(os.path.dirname(apk))
+        with open(apk, 'w') as f:
+            f.write('not really an apk')
+        done, failed = hs.sign_all(g, ['app/build/outputs/apk/release/app-release.apk', 'app/x.txt'], g)
+        self.assertEqual((done, len(failed)), ([], 1))
+        self.assertFalse(os.path.exists(apk))
+        self.assertTrue(os.path.isfile(apk + '.worker-signed'))
+
+    def test_a_bundle_from_a_worker_is_signed_here_with_jarsigner(self):
+        import zipfile
+        hs = importlib.util.module_from_spec(importlib.util.spec_from_file_location(
+            'heavysign_under_test', os.path.join(HERE, 'heavysign.py')))
+        hs.__spec__.loader.exec_module(hs)
+        java, keytool = hs.java_bin()
+        if not keytool:
+            self.skipTest('no JDK')
+        store = os.path.join(self.tmp, 'debug.keystore')   # a throwaway key in place of this PC's debug key
+        r = subprocess.run([keytool, '-genkeypair', '-keystore', store, '-alias', 'androiddebugkey', '-storepass',
+                            'android', '-keypass', 'android', '-keyalg', 'RSA', '-keysize', '2048', '-validity', '2',
+                            '-dname', 'CN=Test'], capture_output=True, text=True, timeout=120)
+        self.assertEqual(r.returncode, 0, r.stderr)
+        hs.DEBUG_KEY = dict(hs.DEBUG_KEY, store=store)
+        g = os.path.join(self.tmp, 'gradle')
+        rel = 'app/build/outputs/bundle/release/app-release.aab'
+        aab = os.path.join(g, *rel.split('/'))
+        os.makedirs(os.path.dirname(aab))
+        with zipfile.ZipFile(aab, 'w', zipfile.ZIP_DEFLATED) as z:   # as a worker leaves it: its own signature on it
+            z.writestr('base/manifest/AndroidManifest.xml', b'\x00manifest')
+            z.writestr('BundleConfig.pb', b'\x01config')
+            z.writestr('META-INF/MANIFEST.MF', 'Manifest-Version: 1.0\r\n\r\n')
+            z.writestr('META-INF/WORKER.SF', 'old')
+            z.writestr('META-INF/WORKER.RSA', 'old')
+        done, failed = hs.sign_all(g, [rel, 'app/build/outputs/x.txt'], g)
+        self.assertEqual(failed, [])
+        self.assertEqual(len(done), 1)
+        with zipfile.ZipFile(aab) as z:
+            names = z.namelist()
+            self.assertEqual(z.read('BundleConfig.pb'), b'\x01config')
+        self.assertFalse(any('WORKER' in n for n in names))   # the worker's signature is gone
+        self.assertTrue(any(n.upper().startswith('META-INF/ANDROIDD') and n.upper().endswith('.RSA') for n in names))
+        self.assertEqual(done[0]['cert'], hs.key_cert_sha256(hs.DEBUG_KEY, keytool, dict(os.environ, HG_KS_PASS='android')))
+        self.assertIn('1 bundle here with the debug key', hs.describe(done))
+
+    def test_a_build_that_reads_an_ignored_file_stays_here(self):
+        if not shutil.which('git'):
+            self.skipTest('no git')
+        g = os.path.join(self.tmp, 'repo')
+        os.makedirs(os.path.join(g, 'android', 'app'))
+        os.makedirs(os.path.join(g, 'web'))
+        files = {'.gitignore': 'keys.js\nandroid/app/src/main/assets/\nkeystore.properties\n',
+                 'keys.js': 'secret', 'keys.example.js': 'none',
+                 'web/shared.js': 'tracked', 'android/app/src/main/assets/shared.js': 'a copy the build makes',
+                 'android/keystore.properties': 'storeFile=x.jks',
+                 'android/app/build.gradle': 'from("../../keys.js")\nfrom("../../web/shared.js")\n'
+                                             'rootProject.file("keystore.properties")\n'}
+        for rel, text in files.items():
+            p = os.path.join(g, *rel.split('/'))
+            os.makedirs(os.path.dirname(p), exist_ok=True)
+            with open(p, 'w') as f:
+                f.write(text)
+        for cmd in (['init', '-q'], ['add', '-A']):
+            subprocess.run(['git', '-C', g, *cmd], capture_output=True, check=True)
+        # keys.js is read and never sent; the shared.js copy is an output; signing files are signed for here
+        self.assertEqual(self.hp.unsent_inputs(g, os.path.join(g, 'android')), ['keys.js'])
+        # a Capacitor app: ignored files under src/ and an ignored module with its own build script are inputs too
+        more = {'.gitignore': 'keys.js\nandroid/app/src/main/assets/\nkeystore.properties\nandroid/app/src/main/res/xml/'
+                              'config.xml\nandroid/plugins/\nandroid/app/build/\n',
+                'android/app/src/main/res/xml/config.xml': '<widget/>', 'android/plugins/build.gradle': '',
+                'android/app/build/outputs/x.apk': 'an output'}
+        for rel, text in more.items():
+            p = os.path.join(g, *rel.split('/'))
+            os.makedirs(os.path.dirname(p), exist_ok=True)
+            with open(p, 'w') as f:
+                f.write(text)
+        self.assertEqual(self.hp.unsent_inputs(g, os.path.join(g, 'android')),
+                         ['app/src/main/res/xml/config.xml', 'plugins/', 'keys.js'])
+
+    def test_a_worker_never_writes_outside_its_copy(self):
+        import io
+        import tarfile
+        buf = io.BytesIO()
+        with tarfile.open(fileobj=buf, mode='w') as t:
+            for name, data in (('../evil.txt', b'x'), ('ok/fine.txt', b'y')):
+                ti = tarfile.TarInfo(name)
+                ti.size = len(data)
+                t.addfile(ti, io.BytesIO(data))
+        buf.seek(0)
+        old = os.environ.get('HEAVYGATE_POOL_DIR')
+        os.environ['HEAVYGATE_POOL_DIR'] = os.path.join(self.tmp, 'copies')
+        try:
+            self.assertEqual(self.hp.worker_recv('proj-1', buf)['files'], 1)
+            with self.assertRaises(self.hp.PoolError):
+                self.hp.worker_dir('../up')
+        finally:
+            os.environ.pop('HEAVYGATE_POOL_DIR') if old is None else os.environ.__setitem__('HEAVYGATE_POOL_DIR', old)
+        self.assertFalse(os.path.exists(os.path.join(self.tmp, 'copies', 'evil.txt')))
+        self.assertTrue(os.path.isfile(os.path.join(self.tmp, 'copies', 'proj-1', 'ok', 'fine.txt')))
+
+
+FAKE_SSH_W = r'''
+import os, socket, sys, threading
+target = sys.argv[sys.argv.index('-W') + 1]
+with open(os.environ['FAKEW_LOG'], 'a') as f:
+    f.write(target + '\n')
+host, port = target.rsplit(':', 1)
+c = socket.create_connection((host, int(port)))
+def up():
+    while True:
+        b = os.read(0, 65536)
+        if not b:
+            break
+        c.sendall(b)
+    c.shutdown(socket.SHUT_WR)
+threading.Thread(target=up, daemon=True).start()
+while True:
+    b = c.recv(65536)
+    if not b:
+        break
+    os.write(1, b)
+'''
+
+
+class CacheTests(unittest.TestCase):
+    """The shared build cache (heavycache.py): its server on a free port here, spoken to as Gradle does."""
+
+    @classmethod
+    def setUpClass(cls):
+        cls.hc = importlib.util.module_from_spec(importlib.util.spec_from_file_location(
+            'heavycache_under_test', os.path.join(HERE, 'heavycache.py')))
+        cls.hc.__spec__.loader.exec_module(cls.hc)
+
+    def setUp(self):
+        import threading
+        self.tmp = tempfile.mkdtemp(prefix='heavygate-cache-')
+        self.addCleanup(shutil.rmtree, self.tmp, True)
+        s = {'cache_token': 'pw-1', 'cache_port': 0, 'cache_dir': os.path.join(self.tmp, 'store'),
+             'cache_max_gb': 3000 / 1024 ** 3, 'cache_entry_max_mb': 1}   # a 3,000-byte cap, 1 MB per entry
+        self.srv = self.hc.make_server(s, host='127.0.0.1')
+        threading.Thread(target=self.srv.serve_forever, daemon=True).start()
+        self.addCleanup(self.srv.server_close)
+        self.addCleanup(self.srv.shutdown)
+        self.url = f'http://127.0.0.1:{self.srv.server_address[1]}/cache/'
+
+    def call(self, method, key, body=None, pw='pw-1'):
+        import base64
+        import urllib.error
+        import urllib.request
+        h = {'Authorization': 'Basic ' + base64.b64encode(f'heavygate:{pw}'.encode()).decode()} if pw else {}
+        req = urllib.request.Request(self.url + key, data=body, method=method, headers=h)
+        try:
+            with urllib.request.urlopen(req, timeout=10) as r:
+                return r.status, r.read()
+        except urllib.error.HTTPError as e:
+            return e.code, e.read()
+
+    def test_it_stores_and_serves_entries_behind_a_password(self):
+        k = 'ab' * 16
+        self.assertEqual(self.call('GET', k)[0], 404)   # a miss
+        self.assertEqual(self.call('PUT', k, b'built once')[0], 200)
+        self.assertEqual(self.call('GET', k), (200, b'built once'))   # a hit
+        self.assertEqual(self.call('GET', k, pw=None)[0], 401)   # no password: nothing
+        self.assertEqual(self.call('PUT', 'cd' * 16, b'x', pw='wrong')[0], 401)
+        self.assertEqual(self.call('GET', 'cd' * 16)[0], 404)   # the refused upload was not kept
+        self.assertEqual(self.call('PUT', '../etc', b'x')[0], 400)   # only hex keys
+        self.assertEqual(self.call('PUT', 'ef' * 16, b'x' * (1024 * 1024 + 1))[0], 413)   # past cache_entry_max_mb
+        st = self.hc.stats(self.url, 'pw-1')
+        self.assertEqual((st['hits'], st['misses'], st['stored'], st['entries'], st['refused']), (1, 2, 1, 1, 1))
+        self.assertIn('1 entries', self.hc.stats_line(st))
+        self.assertIn('wrong password', self.hc.stats(self.url, 'nope')['error'])
+
+    def test_status_reads_it_from_the_pool_answer_without_waking_it(self):
+        hg = load_gate()
+        base = hg.settings()
+        hg.settings = lambda: dict(base, cache_url='http://127.0.0.1:8815/cache/', cache_token='pw-1', cache_host='server2')
+        hg.heavycache.client_state = lambda: ('on', 'http://127.0.0.1:8815/cache/')
+        hg.tray_running = lambda: True
+        self.call('PUT', 'ab' * 16, b'x')
+        self.srv.store.save()
+        summ = self.hc.host_summary({'cache_token': 'pw-1', 'cache_dir': os.path.join(self.tmp, 'store')}, need_unit=False)
+        info = {'ok': True, 'checked_ts': time.time(), 'cache': dict(summ, awake=False)}
+        hg.cache_worker = lambda s=None, workers=None: ('server2', {'host': 'u@server2', 'info': info})
+        c = hg.cache_summary()
+        self.assertEqual((c['host'], c['here'], c['stats']['entries'], c['stats']['stored']), ('server2', 'on', 1, 1))
+        line = [x for x in hg.status_text(dict(hg.snapshot(daemons=False, lockfree=True), cache=c)).splitlines()
+                if 'BUILD CACHE' in x]
+        self.assertEqual(len(line), 1)
+        self.assertIn('BUILD CACHE on server2 (used here): asleep, 1 entries', line[0])
+        hg.tray_running = lambda: False
+        self.assertIn('link is down', hg.status_text(dict(hg.snapshot(daemons=False, lockfree=True),
+                                                          cache=hg.cache_summary())))
+        self.assertEqual(hg.cache_from_info({'ok': False, 'why': 'unreachable: x'}), {'error': 'unreachable: x'})
+        self.assertIn('older than', hg.cache_from_info({'ok': True})['error'])
+        self.assertIsNone(hg.cache_from_info(None))   # not asked yet
+        hg.settings = lambda: dict(base, cache_url='')
+        self.assertIsNone(hg.cache_summary())   # none set up: no line at all
+
+    def test_it_stops_when_idle_and_its_counters_outlive_it(self):
+        import threading
+        self.srv.shutdown()
+        self.srv.server_close()
+        s = {'cache_token': 'pw-1', 'cache_port': 0, 'cache_dir': os.path.join(self.tmp, 'store')}
+        srv = self.hc.make_server(s)
+        self.assertEqual(srv.server_address[0], '127.0.0.1')   # loopback only: the LAN comes in over ssh
+        self.url = f'http://127.0.0.1:{srv.server_address[1]}/cache/'
+        got = []
+        t = threading.Thread(target=lambda: got.append(self.hc.run(srv, idle_s=1.0, every=0.2)), daemon=True)
+        t.start()
+        self.assertEqual(self.call('PUT', 'ab' * 16, b'kept')[0], 200)
+        self.assertEqual(self.call('GET', 'ab' * 16)[0], 200)
+        t.join(15)
+        self.assertEqual(got, ['idle'])   # it ended itself
+        self.assertEqual(self.hc.read_counters(s['cache_dir'])['stored'], 1)
+        again = self.hc.make_server(s)   # the next start (the socket wakes it) carries on counting
+        self.addCleanup(again.server_close)
+        self.assertEqual((again.store.stats['stored'], again.store.stats['hits'], again.store.stats['starts']), (1, 1, 2))
+        summ = self.hc.host_summary(s, need_unit=False)
+        self.assertEqual((summ['entries'], summ['stored'], summ['bytes']), (1, 1, 4))
+        self.assertIn('1 entries', self.hc.stats_line(dict(summ, awake=False)))
+        self.assertTrue(self.hc.stats_line(dict(summ, awake=False)).startswith('asleep, '))
+        self.assertIsNone(self.hc.host_summary({'cache_token': ''}))   # not a cache host
+
+    def test_it_takes_its_socket_from_systemd(self):
+        import socket
+        sock = socket.socket()
+        sock.bind(('127.0.0.1', 0))
+        sock.listen(5)
+        s = {'cache_token': 'pw-1', 'cache_dir': os.path.join(self.tmp, 'sd')}
+        srv = self.hc.make_server(s, sock=sock)
+        self.addCleanup(srv.server_close)
+        self.assertIs(srv.socket, sock)
+        self.assertEqual(srv.server_address, sock.getsockname()[:2])
+        self.assertIsNone(self.hc.systemd_socket())   # no LISTEN_FDS for this process
+
+    def test_units_keep_it_on_loopback_and_off_until_asked(self):
+        svc = self.hc.unit_text('/usr/bin/python3', '/home/u/HeavyGate/heavygate.py', '9.9')
+        self.assertNotIn('[Install]', svc)   # never started at boot: its socket starts it
+        self.assertIn('Requires=heavygate-cache.socket', svc)
+        self.assertIn('Restart=on-failure', svc)   # an idle exit (0) is not restarted
+        self.assertIn('ListenStream=127.0.0.1:8815', self.hc.socket_text(8815, '9.9'))
+        sock, one = self.hc.tunnel_texts('/usr/bin/ssh', ['u@192.0.2.5'], 8815, '9.9')
+        self.assertIn('ListenStream=127.0.0.1:8815', sock)
+        self.assertIn('Accept=yes', sock)   # one ssh per connection, nothing running between
+        self.assertIn('"-W" "127.0.0.1:8815" "u@192.0.2.5"', one)
+        self.assertIn('StandardInput=socket', one)
+        self.assertIn("url = 'http://127.0.0.1:8815/cache/'", self.hc.init_script('http://127.0.0.1:8815/cache/', 'x'))
+
+    def test_the_relay_carries_gradle_through_ssh_and_a_bare_connect_starts_nothing(self):
+        import socket
+        fake = os.path.join(self.tmp, 'fakew.py')
+        log = os.path.join(self.tmp, 'w.log')
+        with open(fake, 'w') as f:
+            f.write(FAKE_SSH_W)
+        port = self.srv.server_address[1]
+        argv = self.hc.tunnel_argv([sys.executable, fake], ['u@server2'], port)
+        os.environ['FAKEW_LOG'] = log
+        self.addCleanup(os.environ.pop, 'FAKEW_LOG', None)
+        probe = socket.socket()
+        probe.bind(('127.0.0.1', 0))
+        rport = probe.getsockname()[1]
+        probe.close()
+        r = self.hc.Relay(argv, rport).start()
+        self.addCleanup(r.stop)
+        with self.assertRaises(OSError):
+            self.hc.Relay(argv, rport).start()   # one link per port
+        bare = socket.create_connection(('127.0.0.1', rport))
+        bare.close()
+        time.sleep(0.3)
+        self.assertEqual(r.started, 0)   # nothing sent: no ssh, nothing woken
+        self.url = f'http://127.0.0.1:{rport}/cache/'   # Gradle's side: the relay
+        self.assertEqual(self.call('PUT', 'ab' * 16, b'through ssh')[0], 200)
+        self.assertEqual(self.call('GET', 'ab' * 16), (200, b'through ssh'))
+        self.assertEqual(self.call('GET', 'ab' * 16, pw=None)[0], 401)
+        self.assertEqual(r.started, 3)
+        with open(log) as f:
+            self.assertEqual(f.read().split(), [f'127.0.0.1:{port}'] * 3)   # each went to the server's loopback
+
+    def test_past_its_size_the_least_recently_used_go(self):
+        keys = [f'{i:02x}' * 16 for i in range(3)]
+        for i, k in enumerate(keys):   # 3,000 bytes: just at the cap
+            self.assertEqual(self.call('PUT', k, bytes([i]) * 1000)[0], 200)
+            past = time.time() - 100 + i * 10
+            os.utime(os.path.join(self.tmp, 'store', k), (past, past))
+        self.call('GET', keys[0])   # the oldest, but used just now: it stays
+        self.assertEqual(self.call('PUT', 'ff' * 16, b'z' * 1000)[0], 200)   # 4,000 bytes against a 3,000 cap
+        kept = sorted(f for f in os.listdir(os.path.join(self.tmp, 'store')) if not f.startswith('.'))
+        self.assertIn(keys[0], kept)
+        self.assertIn('ff' * 16, kept)
+        self.assertNotIn(keys[1], kept)   # the oldest unused one went first
+        self.assertLessEqual(sum(os.path.getsize(os.path.join(self.tmp, 'store', f)) for f in kept), 3000)
+
+    def test_the_init_file_turns_the_cache_on_for_gradle(self):
+        old = os.environ.get('GRADLE_USER_HOME')
+        os.environ['GRADLE_USER_HOME'] = os.path.join(self.tmp, 'gradle')
+        try:
+            self.assertEqual(self.hc.client_state(), ('off', None))
+            p = self.hc.client_on(self.url, "pw'1")
+            with open(p) as f:
+                text = f.read()
+            self.assertIn('buildCacheEnabled = true', text)
+            self.assertIn(f"url = '{self.url}'", text)
+            self.assertIn("password = 'pw\\'1'", text)   # quoted for Groovy
+            self.assertEqual(self.hc.client_state(), ('on', self.url))
+            if not WIN:
+                self.assertEqual(os.stat(p).st_mode & 0o777, 0o600)   # the password is in it
+            self.assertTrue(self.hc.client_off())
+            self.assertEqual(self.hc.client_state(), ('off', None))
+        finally:
+            os.environ.pop('GRADLE_USER_HOME') if old is None else os.environ.__setitem__('GRADLE_USER_HOME', old)
+
+
+class OutputDirTests(unittest.TestCase):
+    """dotnet -o DIR / cargo --target-dir DIR: brought back from inside the project, kept here when outside it."""
+
+    @classmethod
+    def setUpClass(cls):
+        sys.path.insert(0, HERE)
+        import heavypool
+        cls.pool = heavypool
+
+    def test_an_output_folder_inside_the_project_comes_back(self):
+        root = os.path.join(tempfile.gettempdir(), 'App')
+        cwd = os.path.join(root, 'src')
+        pats, out = self.pool.out_patterns(['dotnet', 'publish', '-c', 'Release', '-o', r'..\dist\App-1.0-win-x64'],
+                                           'dotnet', cwd, root)
+        self.assertEqual((pats, out), (['dist/App-1.0-win-x64/**'], []))
+        self.assertTrue(self.pool.matches('dist/App-1.0-win-x64/App.exe', pats))
+        pats, out = self.pool.out_patterns(['cargo', 'build', '--release', '--target-dir=out'], 'cargo', root, root)
+        self.assertEqual((pats, out), (['out/release/*', 'out/debug/*'], []))
+
+    def test_an_output_folder_outside_the_project_is_named(self):
+        root = os.path.join(tempfile.gettempdir(), 'App')
+        pats, out = self.pool.out_patterns(['dotnet', 'publish', '--output', r'..\..\elsewhere'], 'dotnet', root, root)
+        self.assertEqual((pats, out), ([], [r'..\..\elsewhere']))
+        self.assertEqual(self.pool.out_patterns(['dotnet', 'build'], 'dotnet', root, root), ([], []))
+        self.assertEqual(self.pool.out_patterns(['gradlew.bat', '-o', 'x'], 'gradle', root, root), ([], []))
+
+
+class KeyFileTests(unittest.TestCase):
+    """A pool key other accounts can read is refused by Windows' own ssh; HeavyGate tightens it."""
+
+    @classmethod
+    def setUpClass(cls):
+        sys.path.insert(0, HERE)
+        import heavypool
+        cls.pool = heavypool
+
+    def test_a_deleted_account_or_users_group_makes_a_key_too_open(self):
+        path = r'keys\worker_key'
+        out = (f'{path} NT AUTHORITY\\SYSTEM:(I)(F)\n'
+               '                    BUILTIN\\Administrators:(I)(F)\n'
+               '                    PC\\Someone:(I)(F)\n'
+               '                    S-1-5-21-1-2-3-1001:(I)(F)\n\nSuccessfully processed 1 files; Failed processing 0 files\n')
+        self.assertEqual(self.pool.key_too_open(out, 'PC\\Someone', path), ['S-1-5-21-1-2-3-1001'])
+        ok = f'{path} NT AUTHORITY\\SYSTEM:(F)\n                    PC\\Someone:(F)\n'
+        self.assertEqual(self.pool.key_too_open(ok, 'pc\\someone', path), [])
+
+    @unittest.skipUnless(os.name == 'nt', 'Windows file permissions')
+    def test_a_too_open_key_is_tightened_once(self):
+        d = tempfile.mkdtemp()
+        try:
+            key = os.path.join(d, 'k')
+            with open(key, 'w') as f:
+                f.write('not a real key')
+            subprocess.run(['icacls', key, '/grant', '*S-1-5-32-545:R'], capture_output=True)   # Users can read it
+            me = f"{os.environ.get('USERDOMAIN') or os.environ.get('COMPUTERNAME')}\\{os.environ['USERNAME']}"
+            before = subprocess.run(['icacls', key], capture_output=True, text=True).stdout
+            self.assertTrue(self.pool.key_too_open(before, me, key))
+            self.pool.secure_key(key)
+            after = subprocess.run(['icacls', key], capture_output=True, text=True).stdout
+            self.assertEqual(self.pool.key_too_open(after, me, key), [], after)
+            self.assertIn(os.environ['USERNAME'].lower(), after.lower())
+        finally:
+            shutil.rmtree(d, ignore_errors=True)
+
+
+class AppsTests(unittest.TestCase):
+    """Free RAM (heavyapps.py): what is offered for closing, and closing it."""
+
+    @classmethod
+    def setUpClass(cls):
+        sys.path.insert(0, HERE)
+        import heavyapps
+        cls.apps = heavyapps
+
+    def test_windows_heavygate_and_lane_jobs_are_never_offered(self):
+        for name in ('explorer', 'svchost', 'dwm', 'msmpeng', 'sshd', 'python', 'pythonw', 'msedgewebview2'):
+            self.assertIn(name, self.apps.KEEP)
+        names = {a['name'].lower() for a in self.apps.apps(min_mb=0)}
+        self.assertFalse(names & self.apps.KEEP, names & self.apps.KEEP)
+        self.assertFalse(any(n.startswith('heavy') for n in names))
+        self.assertEqual(self.apps.close(['no-such-app-here']), {'no-such-app-here': 'not running'})
+
+    def test_the_strip_links_to_it(self):
+        tray = importlib.util.module_from_spec(importlib.util.spec_from_loader(
+            'tray_links', importlib.machinery.SourceFileLoader('tray_links', os.path.join(HERE, 'heavytray.pyw'))))
+        tray.__spec__.loader.exec_module(tray)
+        st = {'lanes': [{'lane': 'cpu', 'job': {'name': 'b', 'state': 'running', 'for_s': 5}, 'queue': []}],
+              'free_mb': 4096, 'low_ram': False, 'disk': {'floor_gb': 15}, 'view': 'use'}
+        foot = [r for r in tray.strip_lines(st) if r and r[0][0].startswith('RAM ')][0]
+        self.assertIn(('free RAM…', 'name', tray.FREE_RAM), foot)
+        # the apps using the most are listed under it, each with its own "close" link
+        rows = tray.strip_lines(st, [('Spotify', 1200), ('chrome', 900), ('a', 500), ('b', 400), ('c', 300)])
+        closes = [run for r in rows for run in r if len(run) == 3 and run[2].startswith(tray.CLOSE_APP)]
+        self.assertEqual([c[2] for c in closes], [tray.CLOSE_APP + n for n in ('Spotify', 'chrome', 'a', 'b')])
+        self.assertTrue(any('Spotify' in r[0][0] and '1.2 GB' in r[0][0] for r in rows))
+
+    @unittest.skipUnless(WIN, 'closing apps by window is Windows')
+    def test_an_app_you_tick_is_closed(self):
+        tmp = tempfile.mkdtemp(prefix='heavygate-apps-')
+        self.addCleanup(shutil.rmtree, tmp, True)
+        exe = os.path.join(tmp, 'hgdummyapp.exe')   # ping.exe under another name: an app of this user, no window
+        shutil.copy(os.path.join(os.environ.get('SystemRoot', r'C:\Windows'), 'System32', 'PING.EXE'), exe)
+        p = subprocess.Popen([exe, '-n', '300', '127.0.0.1'], stdout=subprocess.DEVNULL, creationflags=0x08000000)
+        self.addCleanup(lambda: p.poll() is None and p.kill())
+        time.sleep(0.5)
+        listed = [a for a in self.apps.apps(min_mb=0) if a['name'].lower() == 'hgdummyapp']
+        self.assertEqual(len(listed), 1, [a['name'] for a in self.apps.apps(min_mb=0)])
+        self.assertIn(p.pid, listed[0]['pids'])
+        said = []
+        out = self.apps.close(['hgdummyapp'], wait_s=1, say=said.append)
+        self.assertEqual(out, {'hgdummyapp': 'ended'})   # no window to ask, so it was ended
+        p.wait(10)
+        self.assertTrue(any('ended' in x for x in said), said)
 
 
 if __name__ == '__main__':

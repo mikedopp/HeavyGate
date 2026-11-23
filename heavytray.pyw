@@ -30,6 +30,7 @@ import os
 import struct
 import subprocess
 import sys
+import threading
 import time
 import tkinter as tk
 import traceback
@@ -41,6 +42,8 @@ sys.path.insert(0, HERE)
 import heavygate as hg  # noqa: E402
 import heavybar  # noqa: E402
 import heavycloud as hc  # noqa: E402
+import heavypool as hpool  # noqa: E402
+import heavycache as hcache  # noqa: E402
 
 GATE = os.path.join(HERE, 'heavygate.py')
 POLL_MS = 3000
@@ -72,7 +75,12 @@ CMD_BEHIND, CMD_DISMISS, CMD_ONTOP, CMD_GRAPHS, CMD_POWER, CMD_RULES = 10, 11, 1
 CMD_SHOW_STRIP, CMD_SHOW_BAR, CMD_BAR_ALL = 16, 18, 17
 MF_BYPOSITION = 0x400
 CMD_OPACITY = 20   # + tenths: 26..30 = 60..100%
-CMD_CLOUD_STRIP, CMD_CLOUD = 40, 41
+CMD_CLOUD_STRIP, CMD_CLOUD, CMD_VIEW = 40, 41, 42
+CMD_APPS = 43
+FREE_RAM = 'action:free-ram'   # the strip's link to the free-RAM window
+CLOSE_APP = 'action:close:'    # + an app's name: that app's "close" link in the strip's list
+APP_ROWS = 4                   # apps listed under the RAM line
+POOL_ASK_S = 60   # the all-lanes view asks the pool workers this often
 CMD_LINK = 200   # + index into the menu's GitHub links (up to 60)
 MF_POPUP = 0x10
 STRIP = {'bg': '#1b1f27', 'name': '#e8ebf0', 'dim': '#8a93a3', 'run': '#30d158', 'wait': '#ffaa33', 'stop': '#ff5c5c',
@@ -228,7 +236,11 @@ def read_state():
         disk = hg.disk_state(lanes)
     except Exception:
         disk = None
-    return {'free_mb': free, 'total_mb': total, 'lanes': lanes, 'eta': eta, 'power': None, 'ollama': hg.ollama_seen(),
+    try:
+        pool = hpool.summary(hg.home(), s)   # pool.json and the trips out now; never calls ssh
+    except Exception:
+        pool = None
+    return {'pool': pool, 'settings': s, 'cpu_slots': hg.slots('cpu'), 'free_mb': free, 'total_mb': total, 'lanes': lanes, 'eta': eta, 'power': None, 'ollama': hg.ollama_seen(),
             'low_ram': free < int(s['reserve_mb']) + LOW_RAM_EXTRA_MB, 'ram_wait_min': s['ram_wait_min'],
             'cloud': cloud, 'disk': disk, 'cloud_mine': bool(mine)}
 
@@ -351,6 +363,81 @@ def runner_rows(a, now=None):
              (f" · {n['cores']} cores{age}", 'dim')]]
 
 
+def trips(st):
+    """Jobs this PC has out on pool workers now."""
+    return list(((st.get('pool') or {}).get('running')) or [])
+
+
+def why_row(why):
+    """The dim line under a job: why it runs where it does."""
+    return [[('      why: ', 'dim'), (short(why, 96), 'dim')]] if why else []
+
+
+def pool_rows(st, full=False):
+    """Strip rows for each job out on a worker: where it went, what it is doing there and why. full adds what was sent
+    and the RAM cap there."""
+    rows = []
+    for r in trips(st):
+        took = hg.fmt_secs(r['for_s'])
+        rows.append([('POOL ', 'dim'), ('► ', 'run'), (short(r['name'], 26), 'name'), ('  → ', 'dim'),
+                     (r['pool'], 'name'), (f'  {took}', 'dim'), (f" · {r.get('doing', 'running')}", 'dim')])
+        if full:
+            bits = []
+            if r.get('phase') == 'sending':
+                bits.append('sending what changed')
+            elif r.get('sent_files') is not None:
+                bits.append(f"sent {r['sent_files']} of {r.get('sent_total', '?')} files ({r.get('sent_mb', 0):.1f} MB)")
+            if r.get('ram_cap_mb'):
+                bits.append(f"RAM cap there {r['ram_cap_mb'] / 1024:.1f} GB")
+            bits.append(short(r.get('project') or os.path.basename(r.get('cwd') or ''), 24))
+            rows.append([('      ' + ' · '.join(b for b in bits if b), 'dim')])
+        rows += why_row(r.get('why'))
+    return rows
+
+
+def cache_rows(st):
+    """The shared build cache in the all-lanes view, from what the app last asked it (never asked on this thread)."""
+    c = st.get('cache')
+    if not c:
+        return []
+    stt = c.get('stats')
+    if stt is None:
+        text, tag = 'not asked yet', 'dim'
+    elif stt.get('error'):
+        text, tag = f"unreachable ({short(stt['error'], 40)})", 'stop'
+    else:
+        looked = stt['hits'] + stt['misses']
+        text = (f"{hcache.fmt_bytes(stt['bytes'])} of {hcache.fmt_bytes(stt['max_bytes'])} · {stt['entries']:,} entries"
+                + (f" · {100 * stt['hits'] / looked:.0f}% hits ({stt['hits']:,} of {looked:,})" if looked else ''))
+        tag = 'dim'
+    if stt and not stt.get('error') and stt.get('awake') is not None:
+        text = ('awake · ' if stt['awake'] else 'asleep · ') + text
+    off = ' · not used here' if c.get('here') != 'on' else '' if c.get('relay', True) else ' · link down'
+    return [[('CACHE ', 'dim'), (c.get('host') or '?', 'name'), ('  ', 'dim'), (text, tag), (off, 'wait' if off else 'dim')]]
+
+
+def worker_row(n, w, s):
+    """One idle pool worker for the all-lanes view, from what it said when last asked (never ssh here)."""
+    inf = w.get('info') or {}
+    age = ''
+    if inf.get('checked_ts'):
+        m = (time.time() - inf['checked_ts']) / 60
+        age = f' · asked {m:.0f}m ago' if m >= 1 else ' · asked just now'
+    if not inf:
+        return [('POOL ', 'dim'), (n, 'name'), ('  not asked yet', 'dim')]
+    if not inf.get('ok'):
+        return [('POOL ', 'dim'), (n, 'name'), ('  ', 'dim'), (short(inf.get('why') or 'unreachable', 40), 'stop'),
+                (age, 'dim')]
+    mine = {'reserve_mb': w['reserve_mb']} if w.get('reserve_mb') is not None else {}
+    _, now, _ = hpool.judge(mine, inf, s, None, False, int((s.get('pool_expect_mb') or {}).get('gradle', 2500)))
+    cpu = inf.get('cpu') or {}
+    others = cpu.get('running', 0)
+    return [('POOL ', 'dim'), (n, 'name'), ('  ready' if now else '  busy', 'run' if now else 'wait'),
+            (f" · {inf.get('mem_free_mb', 0) / 1024:.1f} of {inf.get('mem_total_mb', 0) / 1024:.1f} GB free"
+             f" · lane {others}/{cpu.get('slots', '?')}" + (f" +{cpu['queued']} queued" if cpu.get('queued') else '')
+             + age, 'dim')]
+
+
 def lane_look(L):
     """(state, queued) for the icon: state is free, running or ram."""
     j = L['job']
@@ -382,6 +469,8 @@ def tooltip(st):
             what = 'waits for RAM' if j['state'] == 'waiting for RAM' else hg.fmt_secs(j['for_s'])
             text = f"{short(j['name'], 26)} {what}" + (f' +{len(q)} queued' if q else '')
         lines.append(f"{L['lane'].upper()}: {text}")
+    for r in trips(st):
+        lines.append(f"POOL: {short(r['name'], 20)} on {r['pool']} {hg.fmt_secs(r['for_s'])}")
     if st.get('ollama'):
         lines.append(f"Ollama: {sum(m['mb'] for m in st['ollama']) / 1024:.1f} GB loaded")
     if st.get('cloud'):
@@ -422,6 +511,15 @@ def menu_lines(st):
         for i, qj in enumerate(q, 1):
             note = f"  ·  {hg.eta_note(qj)}" if 'usual_s' in qj else ''
             out.append(f"     queued #{i}: {qj['name']}  {hg.fmt_secs(qj['for_s'])}{note}")
+    if st.get('pool'):
+        out.append(None)
+        try:
+            out += [x.strip() for x in hpool.status_lines(st['pool'], hg.settings())]
+        except Exception:
+            out.append('POOL: cannot read it')
+    c = st.get('cache')
+    if c and c.get('stats'):
+        out.append(f"BUILD CACHE on {c.get('host') or '?'}: " + hcache.stats_line(c['stats']))
     if st.get('cloud'):
         out.append(None)
         out += [x.strip() for x in hc.status_lines(st['cloud'])]
@@ -430,7 +528,7 @@ def menu_lines(st):
 
 def busy(st):
     """Something to show: a lane job running or queued, or a build HeavyGate sent to GitHub."""
-    return any(L['job'] or L['queue'] for L in st['lanes']) or bool(st.get('cloud_mine'))
+    return any(L['job'] or L['queue'] for L in st['lanes']) or bool(st.get('cloud_mine')) or bool(trips(st))
 
 
 def power_rows(p):
@@ -445,44 +543,79 @@ def power_rows(p):
     return [[(f'SHUTTING DOWN in {when}', 'stop'), (' · click here to cancel', 'name')]]
 
 
+def job_rows(lane, j, q):
+    """A lane job's row, why it runs here, what it waits for, and what is next in its queue."""
+    rows = []
+    waiting = j['state'] != 'running'
+    took = hg.fmt_secs(j['for_s']) if j['for_s'] is not None else '?'
+    left = ''
+    if j.get('usual_s') is not None:
+        left = (f" · ~{hg.fmt_eta(j['left_s'])} left" if j.get('left_s') else ' · over its usual time'
+                ) if not waiting else f" · usually {hg.fmt_eta(j['usual_s'])}"
+    stalled = j.get('stalled_s') is not None
+    rows.append([(f'{lane} ', 'dim'), ('■ ' if waiting or stalled else '► ', 'stop' if stalled else 'wait' if waiting else 'run'),
+                 (short(j['name'], 34), 'name'), (f'  {took}', 'dim'),
+                 (f" · STALLED {hg.fmt_eta(j['stalled_s'])}", 'stop') if stalled else (left, 'dim')])
+    if 'need_mb' in j:
+        rows.append([(f"      waiting for RAM: needs {j['need_mb'] / 1024:.1f} GB, "
+                      f"{j['free_mb'] / 1024:.1f} free", 'wait')])
+    rows += why_row(j.get('why'))
+    if q:
+        names = ', '.join(short(x['name'], 24) for x in q[:2]) + (f' +{len(q) - 2} more' if len(q) > 2 else '')
+        rows.append([('      next: ', 'dim'), (names, 'dim')])
+    return rows
+
+
 def strip_lines(st, biggest=None):
-    """The strip's rows as [(text, tag)] runs; [] when nothing is running, waiting or queued (the strip hides) and
-    no shutdown is counting down. Tags are colours: name, dim, run, wait, stop."""
+    """The strip's rows as [(text, tag)] runs. Tags are colours: name, dim, run, wait, stop.
+    st['view'] 'use' (the default): only what is in use, each job with why it runs where it does; [] when nothing is
+    running, waiting or queued (the strip hides) and no shutdown is counting down.
+    'all': every lane, busy or free: GPU, each CPU slot, each pool worker and GitHub; it shows even when all is idle."""
     p = st.get('power')
-    if not busy(st):   # GitHub runs alone bring the strip up only when the user chose that (tray.json cloud_strip)
+    full = st.get('view') == 'all'
+    if not full and not busy(st):   # GitHub runs alone bring the strip up only when the user chose that (cloud_strip)
         return (cloud_rows(st.get('cloud'), alone=True) if st.get('cloud_alone') else []) + (
             power_rows(p) if p and p['phase'] != 'armed' else [])
     rows = []
+    cpu_rows = 0
     for L in st['lanes']:
         j, q, lane = L['job'], L['queue'], L['lane'].upper()
+        if L['lane'] == 'cpu':
+            cpu_rows += 1
         if j:
-            waiting = j['state'] != 'running'
-            took = hg.fmt_secs(j['for_s']) if j['for_s'] is not None else '?'
-            left = ''
-            if j.get('usual_s') is not None:
-                left = (f" · ~{hg.fmt_eta(j['left_s'])} left" if j.get('left_s') else ' · over its usual time'
-                        ) if not waiting else f" · usually {hg.fmt_eta(j['usual_s'])}"
-            stalled = j.get('stalled_s') is not None
-            rows.append([(f'{lane} ', 'dim'), ('■ ' if waiting or stalled else '► ', 'stop' if stalled else 'wait' if waiting else 'run'),
-                         (short(j['name'], 34), 'name'), (f'  {took}', 'dim'),
-                         (f" · STALLED {hg.fmt_eta(j['stalled_s'])}", 'stop') if stalled else (left, 'dim')])
-            if 'need_mb' in j:
-                rows.append([(f"      waiting for RAM: needs {j['need_mb'] / 1024:.1f} GB, "
-                              f"{j['free_mb'] / 1024:.1f} free", 'wait')])
-        else:
-            rows.append([(f'{lane}   ', 'dim'), ('starting' if q else 'free', 'dim')])
-        if q:
-            names = ', '.join(short(x['name'], 24) for x in q[:2]) + (f' +{len(q) - 2} more' if len(q) > 2 else '')
-            rows.append([('      next: ', 'dim'), (names, 'dim')])
+            rows += job_rows(lane, j, q)
+        elif q:
+            rows.append([(f'{lane}   ', 'dim'), ('starting', 'dim')])
+            rows.append([('      next: ', 'dim'), (', '.join(short(x['name'], 24) for x in q[:2]), 'dim')])
+        elif full:
+            rows.append([(f'{lane}   ', 'dim'), ('free', 'dim')])
+    if full:
+        for _ in range(cpu_rows, int(st.get('cpu_slots') or 1)):   # the cpu lane's other slots, free
+            rows.append([('CPU   ', 'dim'), ('free', 'dim')])
+    rows += pool_rows(st, full)
+    if full:
+        pool = st.get('pool') or {}
+        out = {r['pool'] for r in trips(st)}
+        for n, w in (pool.get('workers') or {}).items():
+            if n not in out:
+                rows.append(worker_row(n, w, st.get('settings') or {}))
+        rows += cache_rows(st)
+        # GitHub Actions is a lane too: always a row here, running, idle with the minutes left, or why it can't be read
+        rows += cloud_rows(st.get('cloud')) or [[('CLOUD ', 'dim'), ('GitHub Actions not set up (heavy cloud)', 'dim')]]
     e = st.get('eta')
     if e and e['done_in_s']:
         rows.append([('All done around ', 'dim'), (e['done_at'], 'name'), (f" (~{hg.fmt_eta(e['done_in_s'])})", 'dim')]
                     + ([(f" + {len(e['unknown'])} with no past runs", 'dim')] if e['unknown'] else []))
-    rows += cloud_rows(st.get('cloud'))
-    foot = f"RAM {st['free_mb'] / 1024:.1f} GB free"
-    if biggest:
-        foot += ' · biggest: ' + ', '.join(f'{n} {mb / 1024:.1f} GB' for n, mb in biggest[:2])
-    rows.append([(foot, 'wait' if st['low_ram'] else 'dim')])
+    if not full:
+        rows += cloud_rows(st.get('cloud'), alone=not st.get('cloud_mine'))
+    rows.append([(f"RAM {st['free_mb'] / 1024:.1f} GB free" + (' · using the most:' if biggest else ''),
+                  'wait' if st['low_ram'] else 'dim'), ('   ', 'dim'),
+                 ('free RAM…', 'wait' if st['low_ram'] else 'name', FREE_RAM)])
+    if biggest:   # your own apps by memory (heavyapps: never Windows, HeavyGate or a lane's job), each with "close"
+        w = min(22, max(len(n) for n, _ in biggest[:APP_ROWS]))
+        for n, mb in biggest[:APP_ROWS]:
+            rows.append([(f'   {short(n, 22):<{w}}  {mb / 1024:4.1f} GB   ', 'dim'),
+                         ('close', 'wait' if st['low_ram'] else 'name', CLOSE_APP + n)])
     low = disk_low(st)
     if low:
         rows.append([('DISK LOW: ' + ', '.join(f'{d[:2]} {g:.1f} GB free' for d, g in low)
@@ -676,6 +809,14 @@ class Strip:
         self.urls = {}
         self.buttons = tk.Frame(self.body, bg=STRIP['bg'])
         self.buttons.grid(row=0, column=1, sticky='ne', padx=(0, 4), pady=(2, 0))
+        self.on_view = None   # set by the app: switches between "in use" and "all lanes"
+        self.view_btn = tk.Label(self.buttons, text='all lanes', bg=STRIP['bg'], fg=STRIP['dim'],
+                                 font=('Segoe UI', 8, 'underline'), cursor='hand2', padx=4, pady=0)
+        self.view_btn.pack(side='left')
+        self.view_btn.bind('<ButtonPress-1>', lambda e: 'break')
+        self.view_btn.bind('<ButtonRelease-1>', lambda e: self.button(lambda: self.on_view and self.on_view()))
+        self.view_btn.bind('<Enter>', lambda e: self.view_btn.configure(fg=STRIP['name']))
+        self.view_btn.bind('<Leave>', lambda e: self.view_btn.configure(fg=STRIP['dim']))
         for glyph, fn in (('▾', self.send_behind), ('×', self.dismiss)):   # behind other windows / hide until idle
             b = tk.Label(self.buttons, text=glyph, bg=STRIP['bg'], fg=STRIP['dim'], font=('Segoe UI Symbol', 9),
                          cursor='hand2', padx=3, pady=0)
@@ -696,6 +837,8 @@ class Strip:
         self.rows, self.shown, self.styled, self.grab = None, False, False, None
         self.behind = self.dismissed = self.fullscreen = self.hovered = self.counting = False
         self.on_cancel = None   # set by the app: cancels "shut down when done"
+        self.on_free_ram = None   # set by the app: opens the free-RAM window
+        self.on_close_app = None  # set by the app: closes one app from the strip's list
         self.top_now, self.alpha, self.fade_id, self.graph_w = None, 0.0, None, None
         self.animate, self.alpha_override = motion_on(), None   # the selftest pins both
         self.anchor = self.saved_anchor()
@@ -776,7 +919,11 @@ class Strip:
         self.apply_z(force=True)
 
     def dismiss(self):
-        """Hide until both lanes are next idle; the next busy spell shows it again."""
+        """Hide until both lanes are next idle; the next busy spell shows it again. In the all-lanes view it goes back
+        to the in-use view first, which hides by itself when nothing runs."""
+        if self.prefs.get('strip_view') == 'all':
+            self.prefs['strip_view'] = 'use'
+            save_prefs(self.prefs)
         self.dismissed = True
         self.hide()
 
@@ -825,7 +972,9 @@ class Strip:
                 self.bring_front()
         p = st.get('power')
         self.counting = bool(p and p['phase'] in ('idle', 'countdown'))   # a shutdown on its way always shows
-        rows = strip_lines(st, biggest) if (enabled and not self.dismissed) or self.counting else []
+        full = st.get('view') == 'all'   # asked for: shows whatever "pop up while jobs run" says
+        self.view_btn.configure(text='in use only' if full else 'all lanes')
+        rows = strip_lines(st, biggest) if ((enabled or full) and not self.dismissed) or self.counting else []
         if not rows:
             self.hide()
             self.rows = rows
@@ -920,6 +1069,14 @@ class Strip:
 
     def open_link(self, e):
         url = self.link_at(e)
+        if url == FREE_RAM:   # the RAM line's link: the window that closes apps you pick
+            if self.on_free_ram:
+                self.on_free_ram()
+            return True
+        if url and url.startswith(CLOSE_APP):   # an app's "close" in the list under the RAM line
+            if self.on_close_app:
+                self.on_close_app(url[len(CLOSE_APP):])
+            return True
         if url and url.startswith('https://github.com/'):   # only links the tray built itself
             os.startfile(url)
             return True
@@ -1138,7 +1295,7 @@ class Tray:
         u32.AppendMenuW(m, MF_SEPARATOR, 0, None)
 
         for cid, text in ((CMD_WATCH, 'Close live view' if self.app.watch_open() else 'Open live view'),
-                          (CMD_RULES, 'Rules'), (CMD_LOG, 'Show run log'),
+                          (CMD_APPS, 'Free RAM: close apps…'), (CMD_RULES, 'Rules'), (CMD_LOG, 'Show run log'),
                           (CMD_CLOUD, 'GitHub Actions: minutes and runs'),
                           (CMD_FREE, 'Stop idle Gradle daemons'), (CMD_DEPS, 'Dependencies'),
                           (CMD_FOLDER, 'Open state folder')):
@@ -1155,6 +1312,8 @@ class Tray:
                         'Pop up while jobs run')
         u32.AppendMenuW(m, MF_STRING | (MF_CHECKED if self.app.prefs.get('cloud_strip', False) else 0),
                         CMD_CLOUD_STRIP, 'Pop up for GitHub Actions runs too')
+        u32.AppendMenuW(m, MF_STRING | (MF_CHECKED if self.app.prefs.get('strip_view') == 'all' else 0), CMD_VIEW,
+                        'Show all lanes (GPU, CPU, pool, GitHub), not only what is in use')
         s = self.app.strip
         if s.dismissed:
             u32.AppendMenuW(m, MF_STRING, CMD_DISMISS, 'Show the strip again')
@@ -1227,6 +1386,12 @@ class App:
         self.tray = Tray(self)
         self.strip = Strip(self.root, self.prefs, self.tray.show_menu)
         self.strip.on_cancel = self.cancel_power
+        self.strip.on_view = self.toggle_view
+        self.strip.on_free_ram = self.open_free_ram
+        self.strip.on_close_app = self.close_app
+        self.closing = set()   # apps being closed from the strip's list, kept out of it meanwhile
+        self.pool_asked = 0.0   # when the all-lanes view last asked the pool workers (in the background)
+        self.relay, self.relay_tried = None, 0.0   # this PC's ssh link to the build cache (heavycache.Relay)
         self.meters = Meters()
         self.state, self.biggest, self.ticks, self.closed, self.watch = None, None, 0, False, None
         self.power, self.idle_since = None, None
@@ -1302,6 +1467,15 @@ class App:
             st, err = None, e
         if st:
             st['cloud_alone'] = bool(self.prefs.get('cloud_strip', False))
+            st['view'] = self.prefs.get('strip_view', 'use')
+            if st['settings'].get('cache_url'):
+                n = st['settings'].get('cache_host')
+                w = ((st.get('pool') or {}).get('workers') or {}).get(n) or {}
+                st['cache'] = {'host': n, 'here': hcache.client_state()[0], 'stats': hg.cache_from_info(w.get('info')),
+                               'relay': self.relay is not None}
+            self.keep_relay(st['settings'])
+            if st['view'] == 'all' and (st.get('pool') or st.get('cache')) and time.time() - self.pool_asked > POOL_ASK_S:
+                self.ask_pool(st['settings'])
         self.state = st
         self.tray.update(st, err)
         if not self.sampling():   # while the graphs or the taskbar readout show, sample() reads every second instead
@@ -1309,7 +1483,7 @@ class App:
         if st:
             if self.strip_on and busy(st):
                 if self.biggest is None or self.ticks % 3 == 0:   # every process's memory: not on every tick
-                    self.biggest = hg.top_memory(3)
+                    self.biggest = self.apps_by_memory()
             else:
                 self.biggest = None
             self.strip.fullscreen = self.strip.shown and fullscreen_in_front(self.strip.hwnd)
@@ -1319,6 +1493,77 @@ class App:
             self.strip.show(st, self.biggest, self.strip_on, self.meters.hist)
         self.bar_push()
         self.ticks += 1
+
+    def apps_by_memory(self):
+        """[(name, MB)] for the strip's list: your apps HeavyGate may close (heavyapps), biggest first."""
+        try:
+            import heavyapps
+            return [(a['name'], a['mb']) for a in heavyapps.apps(min_mb=150)
+                    if a['name'].lower() not in getattr(self, 'closing', ())][:APP_ROWS]
+        except Exception:
+            return []
+
+    def close_app(self, name):
+        """The strip's "close" next to an app: asks its windows to close, ends it if still running after 8 s."""
+        if name.lower() in self.closing:
+            return
+        self.closing.add(name.lower())
+        self.biggest = self.apps_by_memory()
+        if self.state:
+            self.strip.show(self.state, self.biggest, self.strip_on, self.meters.hist)
+
+        def work():
+            try:
+                import heavyapps
+                heavyapps.close([name], say=lambda m: hg.log_tray(m) if hasattr(hg, 'log_tray') else None)
+            except Exception:
+                pass
+            finally:
+                self.closing.discard(name.lower())
+                self.biggest = None   # read again on the next tick
+        threading.Thread(target=work, daemon=True).start()
+
+    def open_free_ram(self):
+        """The window listing your apps by memory, to close the ones you tick (heavyapps.pyw)."""
+        subprocess.Popen([sys.executable, os.path.join(os.path.dirname(os.path.abspath(__file__)), 'heavyapps.pyw')])
+
+    def toggle_view(self):
+        """The strip's "all lanes" / "in use only" switch (and the menu's)."""
+        self.prefs['strip_view'] = 'use' if self.prefs.get('strip_view') == 'all' else 'all'
+        save_prefs(self.prefs)
+        if self.prefs['strip_view'] == 'all':
+            self.strip.dismissed = False
+            self.pool_asked = 0.0
+        self.poll()
+
+    def ask_pool(self, s):
+        """Ask the pool workers how they are, on a thread: ssh can take seconds and the tray must not stall."""
+        import threading
+        self.pool_asked = time.time()
+
+        def ask():
+            try:
+                if hpool.load(hg.home())['workers']:
+                    hpool.check(hg.home(), s)
+            except Exception as e:
+                log(f'asking the pool failed: {e!r}')
+        threading.Thread(target=ask, daemon=True).start()
+
+    def keep_relay(self, s):
+        """Runs this PC's link to the build cache while one is set up and this PC uses it; drops it when not. Only
+        the selftest's sample states skip this (no settings there)."""
+        want = hg.cache_relay_argv(s) if hcache.client_state()[0] == 'on' else None
+        if self.relay and (not want or self.relay.argv != want):
+            self.relay.stop()
+            self.relay = None
+            log('build cache link: stopped')
+        if want and not self.relay and time.time() - self.relay_tried > 60:
+            self.relay_tried = time.time()
+            try:
+                self.relay = hcache.Relay(want, s.get('cache_port') or 8815, note=log, flags=hpool.NO_WINDOW).start()
+                log(f"build cache link: 127.0.0.1:{self.relay.port} -> ssh -> {s.get('cache_host')}")
+            except OSError as e:
+                log(f"build cache link: 127.0.0.1:{s.get('cache_port')} is taken ({e}); trying again in a minute")
 
     def power_tick(self, now=None):
         """Shut down when done: while the switch is on and both lanes have been empty for shutdown_idle_s, count down
@@ -1409,6 +1654,8 @@ class App:
             save_prefs(self.prefs)
             if self.strip.shown:
                 self.strip.fade_to(self.strip.target_alpha(), HOVER_MS)
+        elif cid == CMD_APPS:
+            self.open_free_ram()
         elif cid == CMD_RULES:
             subprocess.Popen([sys.executable, os.path.join(os.path.dirname(os.path.abspath(__file__)), 'heavyrules.pyw')])
         elif cid == CMD_LOG:
@@ -1419,6 +1666,8 @@ class App:
             url = self.links[cid - CMD_LINK]
             if url.startswith('https://github.com/'):   # only links the tray built itself
                 os.startfile(url)
+        elif cid == CMD_VIEW:
+            self.toggle_view()
         elif cid == CMD_CLOUD_STRIP:
             self.prefs['cloud_strip'] = not self.prefs.get('cloud_strip', False)
             save_prefs(self.prefs)
@@ -1475,6 +1724,8 @@ class App:
         self.bar_stop()   # gives the taskbar buttons their width back
         if getattr(self, 'cloud_thread', None):
             self.cloud_thread.stop.set()
+        if self.relay:
+            self.relay.stop()
         self.tray.close()
         self.meters.close()
         self.root.destroy()
@@ -1497,11 +1748,16 @@ def sample_states():
         return {'name': name, 'state': state, 'for_s': for_s, 'since_queued_s': for_s, 'pid': 1, 'cwd': '',
                 'command': '', 'expect_mb': 0, **kw}
     base = {'total_mb': 16280, 'ram_wait_min': 10}
+    trip = {'name': 'AppDemo', 'pool': 'server1', 'for_s': 72, 'phase': 'running', 'doing': 'building there',
+            'sent_files': 1, 'sent_total': 69, 'sent_mb': 0.0, 'ram_cap_mb': 5017, 'project': 'AppDemo', 'cwd': '',
+            'why': 'auto: gradle job, server1 had the most room (4.9 GB free past its reserve)'}
     return {
         'busy': dict(base, free_mb=3890, low_ram=False, lanes=[
             {'lane': 'gpu', 'job': job('GameDemo full', 'running', 252),
              'queue': [job('GameDemo race check', 'queued', 40), job('MapDemo shot', 'queued', 12)]},
-            {'lane': 'cpu', 'job': job('AppDemo 0.4.1 build', 'running', 65), 'queue': []}]),
+            {'lane': 'cpu', 'job': job('AppDemo 0.4.1 build', 'running', 65,
+                                       why='cpu lane (rule 1: gradlew); kept here: bundleRelease needs this PC'),
+             'queue': []}]),
         'stalled': dict(base, free_mb=7400, low_ram=False, lanes=[
             {'lane': 'gpu', 'job': None, 'queue': []},
             {'lane': 'cpu', 'job': job('AppDemo 1.7.1 build', 'running', 660, stalled_s=610),
@@ -1513,6 +1769,23 @@ def sample_states():
              'queue': []}]),
         'idle': dict(base, free_mb=6100, low_ram=False, lanes=[{'lane': 'gpu', 'job': None, 'queue': []},
                                                                 {'lane': 'cpu', 'job': None, 'queue': []}]),
+        'pool': dict(base, free_mb=6100, low_ram=False, lanes=[{'lane': 'gpu', 'job': None, 'queue': []},
+                                                                {'lane': 'cpu', 'job': None, 'queue': []}],
+                     pool={'auto': True, 'kinds': ['gradle'], 'workers': {}, 'running': [trip]}),
+        'all': dict(base, free_mb=6100, low_ram=False, view='all', cpu_slots=2, settings={'pool_reserve_mb': 2048},
+                    cloud={'state': 'ok', 'left_min': 1277, 'active': [], 'recent': []},
+                    cache={'host': 'server2', 'here': 'on', 'relay': True, 'stats': {
+                        'hits': 312, 'misses': 40, 'entries': 1204, 'bytes': 860 * 1024 ** 2, 'max_bytes': 5 * 1024 ** 3,
+                        'stored': 410, 'since': time.time() - 7200, 'awake': False}},
+                    lanes=[{'lane': 'gpu', 'job': None, 'queue': []},
+                           {'lane': 'cpu', 'job': job('ToolDemo publish', 'running', 31,
+                                                      why='cpu lane (rule 3: dotnet publish)'), 'queue': []}],
+                    pool={'auto': True, 'kinds': ['gradle'], 'running': [trip], 'workers': {
+                        'server1': {'host': 'me@server1', 'info': {'ok': True}},
+                        'server2': {'host': 'me@server2', 'info': {
+                            'ok': True, 'checked_ts': time.time() - 120, 'mem_free_mb': 6200, 'mem_total_mb': 7800,
+                            'cpu': {'running': 0, 'slots': 2, 'queued': 0}, 'kinds': ['gradle'],
+                            'android_sdk': '/sdk', 'disk_free_gb': 80, 'disk_floor_gb': 15}}}}),
     }
 
 
@@ -1551,7 +1824,7 @@ def selftest(out):
               'menu': menu_lines(app.state) if app.state else None, 'look': t.look,
               'strip_now': [''.join(x[0] for x in r) for r in strip_lines(app.state)] if app.state else None,
               'gpu_reading': app.meters.gpu(), 'rest_alpha': s.rest_alpha(), 'strip': {}}
-    states, biggest, hist = sample_states(), [('msedgewebview2', 4100), ('node', 1020)], demo_history()
+    states, biggest, hist = sample_states(), [('chrome', 4100), ('Spotify', 1020)], demo_history()
     b = states['busy']   # what estimate() would add from past runs
     b['lanes'][0]['job'].update(usual_s=4226, runs=4, left_s=3974)
     for q in b['lanes'][0]['queue']:

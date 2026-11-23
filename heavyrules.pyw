@@ -1244,9 +1244,9 @@ def selftest(out):
     now = '2026-11-0%dT10:00:00'
     with open(os.path.join(hg.home(), 'runs.jsonl'), 'w') as f:
         for i in (1, 2, 3):
-            f.write(json.dumps({'name': 'render', 'lane': 'cpu', 'command': 'python tools/render.py', 'cwd': r'F:\Demo',
+            f.write(json.dumps({'name': 'render', 'lane': 'cpu', 'command': 'python tools/render.py', 'cwd': r'C:\Demo',
                                 'ran_s': 90, 'gpu_util_max': 85, 'cpu_avg': 20, 'started': now % i}) + '\n')
-            f.write(json.dumps({'name': 'site', 'lane': 'cpu', 'command': 'pack.cmd', 'cwd': r'F:\Demo\Site', 'ran_s': 400,
+            f.write(json.dumps({'name': 'site', 'lane': 'cpu', 'command': 'pack.cmd', 'cwd': r'C:\Demo\Site', 'ran_s': 400,
                                 'gpu_util_max': 5, 'cpu_avg': 72, 'started': (now % i).replace('T10', 'T12')}) + '\n')
     # pack.cmd's "all threads" tip needs a usual share under the whole machine. On 2 cores the default share is both,
     # so the suggestions part runs with half the threads; the setting goes before the share controls are tried.

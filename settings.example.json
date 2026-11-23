@@ -60,5 +60,40 @@
   "cloud_storage_gb": 0,
   "cloud_keep_days": 3,
   "cloud_artifacts_s": 3600,
-  "cloud_delete_after": true
+  "cloud_delete_after": true,
+  "pool_auto": false,
+  "pool_kinds": [
+    "gradle"
+  ],
+  "pool_reserve_mb": 2048,
+  "pool_expect_mb": {
+    "gradle": 2500,
+    "dotnet": 1500,
+    "cargo": 2500
+  },
+  "pool_outputs": {
+    "gradle": [
+      "build/outputs/**",
+      "build/install/**",
+      "build/libs/**"
+    ],
+    "dotnet": [
+      "bin/**"
+    ],
+    "cargo": [
+      "target/release/*",
+      "target/debug/*"
+    ],
+    "any": []
+  },
+  "pool_resign": true,
+  "pool_java": "",
+  "pool_auto_skip": [
+    "publish",
+    "install",
+    "connected",
+    "device"
+  ],
+  "pool_ssh_timeout_s": 8,
+  "pool_max_send_mb": 400
 }

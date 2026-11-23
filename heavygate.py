@@ -19,6 +19,9 @@
                        heavy cloud dispatch REPO WORKFLOW starts one there (heavycloud.py). heavy cloud map ties a
                        build command to a workflow; with heavy cloud auto on, heavy auto sends it to GitHub when the
                        PC is short, follows the run and brings its files back into the project (--cloud / --no-cloud)
+    heavy pool         your other machines as more cpu lanes, over SSH (heavypool.py): heavy pool add NAME USER@HOST,
+                       then heavy cpu --pool -- gradlew assembleDebug sends that job to the worker with the most room
+                       and brings build/outputs back; heavy pool auto on sends every Gradle job (--pool / --no-pool)
     heavy deps         what this tool depends on
 
 Disk floor (1.16.0): a job does not start while the drive it runs on, or the temp/caches drive, has under
@@ -64,8 +67,10 @@ _HERE = os.path.dirname(os.path.abspath(__file__))
 if _HERE not in sys.path:   # heavycloud.py sits beside this file; also when loaded through the old tools-path stub
     sys.path.append(_HERE)
 import heavycloud  # noqa: E402
+import heavypool  # noqa: E402
+import heavycache  # noqa: E402
 
-VERSION = '1.19.1'
+VERSION = '1.34.0'
 LANES = ('gpu', 'cpu')
 DEFAULT_HOME = os.path.join((os.environ.get('LOCALAPPDATA') or os.path.expanduser('~')) if os.name == 'nt' else
                             (os.environ.get('XDG_STATE_HOME') or os.path.expanduser('~/.local/state')), 'HeavyGate')
@@ -111,6 +116,8 @@ DEFAULTS = {
     'disk_paths': [],                           # more folders whose drives are checked too (a cache on another drive)
 }
 DEFAULTS.update(heavycloud.DEFAULTS)            # the cloud lane's settings (GitHub Actions): see heavycloud.py
+DEFAULTS.update(heavypool.DEFAULTS)             # the pool's settings (other machines over SSH): see heavypool.py
+DEFAULTS.update(heavycache.DEFAULTS)            # the shared Gradle build cache: see heavycache.py
 BUSY_EXIT = 75
 DISK_EXIT = 28   # ENOSPC: refused or ended because a drive was too full
 WIN = os.name == 'nt'
@@ -839,7 +846,7 @@ def job_view(r, queued=False):
     j = {'name': r.get('name', '(starting)'), 'state': state, 'for_s': round(now - since) if since else None,
          'since_queued_s': round(now - r['queued_ts']) if r.get('queued_ts') else None, 'pid': r.get('pid'),
          'cwd': r.get('cwd', ''), 'command': r.get('command', ''), 'expect_mb': r.get('expect_mb'),
-         'threads': r.get('threads')}
+         'threads': r.get('threads'), 'why': r.get('why') or ''}
     if state == 'waiting for RAM' and r.get('ram'):
         j.update(need_mb=r['ram']['need_mb'], free_mb=r['ram']['free_mb'])
     if state == 'running' and r.get('idle_since_ts'):
@@ -895,7 +902,7 @@ def usual_secs(name, command='', cwd=None):
     """(median run time of the last five matching runs, how many matched), or (None, 0) with no history. Failed runs
     and runs under a second don't count: neither says how long the job takes. Matched by name first, then by command
     and folder."""
-    rows = [r for r in history() if r.get('exit') in (0, None) and r['ran_s'] >= 1]
+    rows = [r for r in history() if r.get('exit') in (0, None) and r['ran_s'] >= 1 and not r.get('pool')]
     kn = name_key(name)
     m = [r for r in rows if name_key(r.get('name')) == kn] if kn else []
     if not m and command:
@@ -1511,7 +1518,8 @@ def check_threads(lane, threads):
 
 
 @contextmanager
-def hold(lane, name, expect_mb=None, say=None, wait=True, command='', cwd=None, threads=None, max_wait_s=None):
+def hold(lane, name, expect_mb=None, say=None, wait=True, command='', cwd=None, threads=None, max_wait_s=None,
+         why=''):
     """Hold a lane for the length of the with-block (queue, then wait for RAM). Re-entrant: inside a held lane, in
     this process or a child of it, every hold() passes straight through. threads overrides cpu_threads for this job;
     more than the machine has means all of them."""
@@ -1535,7 +1543,7 @@ def hold(lane, name, expect_mb=None, say=None, wait=True, command='', cwd=None, 
     os.makedirs(queue_dir(lane), exist_ok=True)
     rec = {'name': name, 'lane': lane, 'pid': os.getpid(), 'cwd': cwd or os.getcwd(), 'command': (command or '')[:400],
            'queued': now_iso(), 'queued_ts': time.time(), 'expect_mb': expect,
-           'threads': min(share, cores) if lane == 'cpu' else None}
+           'threads': min(share, cores) if lane == 'cpu' else None, 'why': (why or '')[:300]}
     ticket = os.path.join(queue_dir(lane), f'{time.time_ns():020d}-{os.getpid()}.ticket')
     tfd = _open_excl(ticket, create_new=True)
     if tfd is None:
@@ -1828,6 +1836,22 @@ def suggestions(rows=None, data=None, limit=4):
 
 
 # command line -------------------------------------------------------------------------------------------------------
+CMD_OPERATOR = re.compile(r'^(&&?|\|\|?|<|\d?>>?(&\d|nul)?)$', re.I)
+
+
+def win_join(args):
+    """Separate words as one cmd.exe line (the lane runs it through cmd.exe /c): list2cmdline's quoting, plus quotes
+    around a word holding & | < > ^ ( ), which cmd.exe would otherwise act on. A word that is only an operator (&&,
+    |, 2>&1) stays one, for callers that split a shell line into words."""
+    out = []
+    for a in args:
+        q = subprocess.list2cmdline([a])
+        if q == a and set(a) & set('&|<>^()') and not CMD_OPERATOR.match(a):
+            q = '"' + a + '\\' * (len(a) - len(a.rstrip('\\'))) + '"'
+        out.append(q)
+    return ' '.join(out)
+
+
 def local_script(line, cwd):
     """'build.cmd x' -> '.\\build.cmd x' when the script is in cwd (cmd.exe may skip the current folder), and
     './gradlew x' -> '.\\gradlew x', because cmd.exe reads a / in the program's path as a switch."""
@@ -1923,18 +1947,26 @@ def cmd_run(lane, a):
         print('heavy: nothing to run (heavy <lane> -n NAME -- command ...)', file=sys.stderr)
         return 2
     line = local_script(command[0] if len(command) == 1 else
-                        subprocess.list2cmdline(command) if WIN else shlex.join(command), os.getcwd())
+                        win_join(command) if WIN else shlex.join(command), os.getcwd())
     if not WIN:   # a stopped heavy takes its job with it, as Ctrl+C does
         signal.signal(signal.SIGTERM, _interrupt)
         signal.signal(signal.SIGHUP, _interrupt)
     name = a.name or line[:60]
     threads = a.threads
+    a.here_why = []   # why the pool or GitHub didn't take it, for status and the tray
     if lane == 'auto':
         r = route(line)
         lane = r['lane']
         if threads is None:
             threads = r['threads']
         print(f"[heavy] {name}: {r['why']}", file=sys.stderr, flush=True)
+        a.lane_why = r['why']
+    else:
+        a.lane_why = (f"sent from {os.environ['HEAVYGATE_FROM']} by heavy pool, {lane} lane"
+                      if os.environ.get('HEAVYGATE_FROM') else f'{lane} lane (asked for: heavy {lane})')
+    code = pool_first(lane, a, command, name)
+    if code is not None:
+        return code
     code = cloud_first(lane, a, line, name)
     if code is not None:
         return code
@@ -1944,8 +1976,9 @@ def cmd_run(lane, a):
         print(f'heavy: {e}', file=sys.stderr)
         return 2
     try:
+        why = '; '.join([a.lane_why] + a.here_why)
         with hold(lane, name, a.expect, wait=not a.no_wait, command=line, threads=threads,
-                  max_wait_s=getattr(a, 'wait_max', None)) as slot:
+                  max_wait_s=getattr(a, 'wait_max', None), why=why) as slot:
             job = None
             if WIN and not slot.nested:
                 s = settings()
@@ -1994,6 +2027,451 @@ def cmd_run(lane, a):
         return 130
 
 
+def pool_first(lane, a, command, name):
+    """A cpu job may run on a worker of the pool instead (heavypool.py). Returns its exit code when it ran there, None
+    to run it here: never for the GPU lane, a job inside another, --no-pool or HEAVYGATE_POOL=off; auto mode only for
+    pool_kinds and only on a worker that can start it now; anything that goes wrong before the job started on the
+    worker falls back to running here."""
+    here = getattr(a, 'here_why', None)
+    if here is None:
+        here = a.here_why = []
+    if lane == 'gpu' and getattr(a, 'pool', None) is None:
+        return None   # the gpu lane goes out only when asked (--pool), to a Windows worker with a graphics card
+    if getattr(a, 'no_pool', False) or os.environ.get('HEAVYGATE_POOL', '').lower() == 'off':
+        if heavypool.load(home())['workers']:
+            here.append('kept off the pool (--no-pool)')
+        return None   # inside a held job it may still go: build-android.cmd holds the lane, its Gradle step goes out
+    s = settings()
+    asked = getattr(a, 'pool', None)   # None: not asked; '': any worker; NAME: that one
+    if asked is None and not s.get('pool_auto'):
+        return None
+    say = cloud_say(name)
+    if not heavypool.load(home())['workers']:
+        if asked is not None:
+            say('--pool: there are no workers yet (heavy pool add NAME USER@HOST); running it here')
+        return None
+    tokens = heavypool.tokens_of(command)
+    kind = heavypool.kind_of(tokens)
+    if asked is None and kind not in (s.get('pool_kinds') or []):
+        return None
+    if asked is None:
+        word = heavypool.auto_skip(tokens, s, kind)
+        if word:
+            say(f'pool: {word} stays here (pool_auto_skip: signing keys and devices are on this PC)')
+            here.append(f'kept here: {word} needs this PC (pool_auto_skip)')
+            return None
+    cwd = os.getcwd()
+    outside = heavypool.out_patterns(tokens, kind, cwd, heavypool.project_root(cwd))[1]
+    if outside:   # dotnet -o ..\dist\X: the worker would write it where no trip brings it back from
+        if asked is None:
+            say(f"pool: it writes to {', '.join(outside)}, outside the project a trip sends and brings back; it stays "
+                f"here")
+            here.append(f"kept here: writes to {outside[0]}, outside the project")
+            return None
+        say(f"pool: WARNING: it writes to {', '.join(outside)}, outside the project: that output stays on the worker "
+            f"(--pool asked for it anyway)")
+    gdir = heavypool.gradle_dir(tokens, cwd) if kind == 'gradle' else cwd
+    if kind == 'gradle':
+        missing = heavypool.unsent_inputs(heavypool.project_root(cwd), gdir)
+        if missing and asked is None:
+            say(f"pool: the build reads {', '.join(missing)}, which git ignores and a trip never sends; it stays here")
+            here.append(f"kept here: reads {', '.join(missing[:2])}{' and more' if len(missing) > 2 else ''}, "
+                        f"which git ignores and a trip never sends")
+            return None
+        if missing:
+            say(f"pool: WARNING: the build reads {', '.join(missing)}, which git ignores and a trip never sends: the "
+                f"worker builds without it (--pool asked for it anyway)")
+    expect = a.expect or int((s.get('pool_expect_mb') or {}).get(kind, s['expect_mb'][lane]))
+    import heavysplit
+    if lane == 'gpu' and not asked:   # --pool with no name: the first worker that has a graphics card
+        workers = heavypool.load(home())['workers']
+        infos = heavypool.check(home(), s, list(workers))
+        gpus = [n for n in workers if heavysplit.can_take(infos[n], 'gpu', tokens, True)[0]]
+        if not gpus:
+            say('pool: no worker has a graphics card for the gpu lane (a Windows worker with one); running it here')
+            here.append('kept here: no worker with a graphics card')
+            return None
+        asked = gpus[0]
+    try:
+        wname, w, inf, why = heavypool.pick(home(), s, kind, kind == 'gradle' and heavypool.is_android(gdir), expect,
+                                            want=asked)
+        if not wname:
+            say('pool: no worker can take it now (' + '; '.join(f'{n}: {r}' for n, r in why.items())
+                + '); running it here')
+            here.append('kept here: no worker could take it (' + '; '.join(f'{n}: {r}' for n, r in why.items()) + ')')
+            return None
+        if lane == 'gpu':
+            ok, whynot = heavysplit.can_take(inf, 'gpu', tokens, True)
+            if not ok:
+                say(f'pool: {wname} cannot take a gpu lane job ({whynot}); running it here')
+                here.append(f'kept here: {wname}: {whynot}')
+                return None
+        room = heavypool.room_mb(w, inf, s) / 1024
+        went = (f'auto: {kind} job, {wname} had the most room ({room:.1f} GB free past its reserve)' if asked is None
+                else f'--pool={wname}' if asked else f'--pool: {wname} had the most room ({room:.1f} GB free)')
+        rec = heavypool.trip(home(), s, wname, w, inf, cwd, tokens, kind, name, say, why=went, lane=lane,
+                             extra=getattr(a, 'send', None), back=getattr(a, 'back', None),
+                             desktop=getattr(a, 'desktop', False))
+    except heavypool.PoolError as e:
+        say(f'pool: {e}; running it here')
+        here.append(f'kept here: {e}')
+        return None
+    except KeyboardInterrupt:
+        return 130
+    _log(rec)
+    return rec['exit']
+
+
+def cache_worker(s=None, workers=None):
+    """(name, pool worker entry) of the machine that serves the cache, or (name, None)."""
+    s = s or settings()
+    workers = workers if workers is not None else heavypool.load(home())['workers']
+    n = s.get('cache_host')
+    return n, workers.get(n)
+
+
+def cache_relay_argv(s=None):
+    """This PC's ssh -W command to the cache's machine (heavycache.Relay runs one per connection), or None."""
+    s = s or settings()
+    if not s.get('cache_url'):
+        return None
+    n, w = cache_worker(s)
+    if not w:
+        return None
+    target = (['-i', w['key']] if w.get('key') else []) + (['-p', str(w['port'])] if w.get('port') else []) + [w['host']]
+    return heavycache.tunnel_argv(heavypool.ssh_exe(), target, int(s.get('cache_port') or 8815))
+
+
+def cache_from_info(info):
+    """The cache counters out of a pool worker's last answer (heavypool.worker_info), or {'error': why}."""
+    if not info:
+        return None   # not asked yet
+    if not info.get('ok'):
+        return {'error': info.get('why') or 'no answer'}
+    c = info.get('cache')
+    if not c:
+        return {'error': 'no cache there (or HeavyGate there is older than 1.25.0)'}
+    return dict(c, checked_ts=info.get('checked_ts'))
+
+
+def cache_summary():
+    """The shared build cache for status, from what its machine said when the pool was last asked (over ssh, so the
+    cache isn't woken just to be looked at). None when none is set up."""
+    s = settings()
+    if not s.get('cache_url'):
+        return None
+    state, _ = heavycache.client_state()
+    n, w = cache_worker(s)
+    return {'host': n, 'url': s['cache_url'], 'here': state, 'relay': tray_running(),
+            'stats': cache_from_info((w or {}).get('info')) or {'error': 'not asked yet (heavy pool)'}}
+
+
+def cmd_cache(a):
+    """heavy cache [status|setup NAME|on|off|remove|serve|tunnel]: the shared Gradle build cache (heavycache.py)."""
+    s = settings()
+    act = a.action
+    if act == 'serve':
+        return heavycache.serve(s)
+    if act in ('_host', '_client-on'):   # the server's / a worker's side, run over ssh; settings come on stdin as JSON
+        cfg = json.loads(sys.stdin.read() or '{}')
+        if act == '_host':
+            r = heavycache.host_install(cfg, sys.executable, os.path.abspath(__file__), VERSION, set_setting)
+        else:
+            r = {'ok': True, 'steps': [f"init file: {heavycache.client_on(cfg['url'], cfg['token'])}"]}
+            if cfg.get('ssh'):
+                link = heavycache.link_on(cfg['ssh'], cfg.get('port') or 8815, VERSION)
+                r = {'ok': link['ok'], 'steps': r['steps'] + link['steps']}
+            elif heavycache.link_off():
+                r['steps'].append('ssh link: removed (this machine serves the cache)')
+        print(json.dumps(r))
+        return 0 if r['ok'] else 1
+    if act == '_client-off':
+        print(json.dumps({'ok': True, 'removed': heavycache.client_off()}))
+        return 0
+    if act == '_host-remove':
+        print(json.dumps(heavycache.host_remove()))
+        return 0
+    if act == 'tunnel':   # this PC's link, in the foreground (the tray runs the same thing)
+        argv = cache_relay_argv(s)
+        if not argv:
+            print('heavy cache tunnel: no cache set up, or its machine is not in the pool', file=sys.stderr)
+            return 2
+        try:
+            r = heavycache.Relay(argv, s.get('cache_port') or 8815, note=print,
+                                 flags=heavypool.NO_WINDOW).start()
+        except OSError as e:
+            print(f"heavy cache tunnel: 127.0.0.1:{s.get('cache_port')} is taken ({e}); the tray may hold it already",
+                  file=sys.stderr)
+            return 1
+        print(f"Build cache link: 127.0.0.1:{r.port} -> ssh -> {s.get('cache_host')}; Ctrl+C ends it")
+        try:
+            while True:
+                time.sleep(3600)
+        except KeyboardInterrupt:
+            r.stop()
+        return 0
+    workers = heavypool.load(home())['workers']
+
+    def on_workers(action, cfg_for=None):
+        for n, w in workers.items():
+            if heavypool.is_windows(w):
+                print(f'  {n}: skipped (a Windows worker has no link to the cache yet; its builds run without it)')
+                continue
+            cfg = cfg_for(n) if cfg_for else None
+            code, out, err = heavypool.run_ssh(w, ['cache', action], s, timeout=90,
+                                               stdin=_json_stdin(cfg) if cfg is not None else None)
+            try:
+                r = json.loads(heavypool.last_line(out))
+            except ValueError:
+                r = {'ok': False}
+            print(f"  {n}: " + ('ok' if code == 0 and r.get('ok') else f"FAILED ({heavypool.last_line(err) or code})"))
+            for line in r.get('steps', []):
+                print(f'      {line}')
+
+    def show(name):
+        found = heavypool.check(home(), s, [name]).get(name)
+        st = cache_from_info(dict(found or {}, ok=(found or {}).get('ok'))) or {'error': 'no answer'}
+        print(f'  {name}: {heavycache.stats_line(st)}')
+        return st
+
+    if act == 'setup':
+        if not a.name or a.name not in workers:
+            print('heavy cache setup NAME: NAME is a pool worker that is always on (heavy pool lists them)',
+                  file=sys.stderr)
+            return 2
+        w = workers[a.name]
+        token = s.get('cache_token') if s.get('cache_host') == a.name and s.get('cache_token') else heavycache.new_token()
+        cfg = {'token': token, 'port': int(s['cache_port']), 'max_gb': s['cache_max_gb'],
+               'idle_min': s['cache_idle_min']}
+        print(f'Setting up the build cache on {a.name}:')
+        code, out, err = heavypool.run_ssh(w, ['cache', '_host'], s, timeout=120, stdin=_json_stdin(cfg))
+        try:
+            r = json.loads(heavypool.last_line(out))
+        except ValueError:
+            print(f'  failed: {heavypool.last_line(err) or heavypool.last_line(out) or code}', file=sys.stderr)
+            return 1
+        for line in r.get('steps', []):
+            print(f'  {line}')
+        url = f"http://127.0.0.1:{r['port']}/cache/"
+        for k, v in (('cache_url', url), ('cache_token', token), ('cache_host', a.name)):
+            set_setting(k, v)
+        st = show(a.name)
+        if not r.get('ok') or st.get('error'):
+            return 1
+        print(f'The cache is up on {a.name}, on its loopback only. heavy cache on points this PC and every pool worker '
+              f'at it, through ssh.')
+        return 0
+    if act in ('on', 'off'):
+        if act == 'on':
+            if not s.get('cache_url'):
+                print('heavy cache on: no cache yet (heavy cache setup NAME)', file=sys.stderr)
+                return 2
+            host, hw = cache_worker(s, workers)
+            if not hw:
+                print(f'heavy cache on: {host} is not in the pool any more', file=sys.stderr)
+                return 2
+            port = int(s.get('cache_port') or 8815)
+            url = f'http://127.0.0.1:{port}/cache/'
+            set_setting('cache_url', url)
+            print(f'Every Gradle build now uses the cache on {host}, through ssh:')
+            print(f'  here: {heavycache.client_on(url, s["cache_token"])}')
+            print('      the tray carries this PC\'s link (heavy tray); without it builds here skip the cache'
+                  + ('' if tray_running() else ' (the tray is not running now)'))
+            on_workers('_client-on', lambda n: {'url': url, 'token': s['cache_token'], 'port': port,
+                                                'ssh': None if n == host else [hw['host']]})
+        else:
+            print('Gradle builds no longer use the shared cache:')
+            print(f"  here: {'removed ' + heavycache.init_path() if heavycache.client_off() else 'was not on'}")
+            on_workers('_client-off')
+        return 0
+    if act == 'remove':   # the server too
+        host = s.get('cache_host')
+        a.action = 'off'
+        cmd_cache(a)
+        if host in workers:
+            code, out, err = heavypool.run_ssh(workers[host], ['cache', '_host-remove'], s, timeout=60)
+            print(f'  {host}: socket and service ' + ('stopped and removed' if code == 0 else f'NOT removed ({code})')
+                  + f'; its entries stay in ~/.cache/heavygate-buildcache until you delete them')
+        for k in ('cache_url', 'cache_token', 'cache_host'):
+            set_setting(k, None)
+        return 0
+    # status: asked over ssh, so looking doesn't wake it
+    if not s.get('cache_url'):
+        print('Build cache: not set up (heavy cache setup NAME runs it on a pool worker)')
+        return 0
+    state, url = heavycache.client_state()
+    print(f"Build cache on {s.get('cache_host') or '?'} (loopback there, reached through ssh):")
+    st = show(s.get('cache_host'))
+    here = ('on' if state == 'on' and url and url.startswith('http://127.0.0.1') else
+            'OFF (heavy cache on)' if state == 'off' else 'an init file points elsewhere (heavy cache on)')
+    print(f"  this PC: {here}, link {'in the tray' if tray_running() else 'DOWN: the tray is not running (heavy tray)'}"
+          f"  ({heavycache.init_path()})")
+    if a.json:
+        print(json.dumps(st))
+    return 1 if st.get('error') else 0
+
+
+def _json_stdin(obj):
+    """A JSON value as a file ssh can read as its stdin: secrets go there, never on a command line."""
+    f = tempfile.TemporaryFile()
+    f.write(json.dumps(obj).encode())
+    f.seek(0)
+    return f
+
+
+def cmd_pool(a):
+    """heavy pool [list|add|remove|auto]."""
+    s = settings()
+    if a.action == 'add':
+        if not (a.name and a.host):
+            print('heavy pool add NAME USER@HOST [--key FILE] [--port N] [--reserve-mb N]', file=sys.stderr)
+            return 2
+        probe = {'host': a.host, 'key': os.path.abspath(os.path.expanduser(a.key)) if a.key else None, 'port': a.port}
+        try:
+            kind = heavypool.detect_os({k: v for k, v in probe.items() if v}, s)
+        except heavypool.PoolError as e:
+            kind = None
+            print(f"heavy pool: could not ask {a.host} what it runs ({e}); added as Linux. A Windows machine: "
+                  f"heavy pool remove {a.name}, then add it again once it answers.", file=sys.stderr)
+        try:
+            heavypool.add(home(), a.name, a.host, a.key, a.port, a.reserve_mb, a.heavy,
+                          os_name='windows' if kind == 'windows' else None)
+        except heavypool.PoolError as e:
+            print(f'heavy pool: {a.host}: {e}', file=sys.stderr)
+            return 2
+        if kind == 'windows':
+            print(f'Added {a.name} ({a.host}), a Windows machine. Copying HeavyGate there (heavy pool install):')
+            a.action = 'install'
+            if cmd_pool(a):
+                return 1
+        print(f'Added {a.name} ({a.host}). Asking it now:')
+        a.action, a.only = 'list', [a.name]
+    elif a.action == 'install':
+        w = heavypool.load(home())['workers'].get(a.name)
+        if not w:
+            print(f'heavy pool install NAME: no worker named {a.name}', file=sys.stderr)
+            return 2
+        if not heavypool.is_windows(w):
+            print(f'{a.name} is not a Windows worker: on Linux, clone HeavyGate there and run ./install.sh '
+                  '(its git checkout stays clean that way)', file=sys.stderr)
+            return 2
+        try:
+            print(f'  {a.name}: ~/HeavyGate: ' + heavypool.install(w, s, os.path.dirname(os.path.abspath(__file__))))
+        except heavypool.PoolError as e:
+            print(f'  {a.name}: {e}', file=sys.stderr)
+            return 1
+        return 0
+    elif a.action == 'tray':
+        w = heavypool.load(home())['workers'].get(a.name)
+        if not w or not heavypool.is_windows(w):
+            print(f'heavy pool tray NAME: {a.name or "(none)"} is not a Windows worker (on Linux: heavy watch there, '
+                  'or heavy status from here)', file=sys.stderr)
+            return 2
+        c, out, err = heavypool.run_ssh(w, ['tray', '--at-sign-in', 'on'], s, timeout=60)   # starts it now too
+        for line in (out if c == 0 else err or str(c)).strip().splitlines():
+            print(f'  {a.name}: {line}')
+        return 1 if c else 0
+    elif a.action == 'remove':
+        if not a.name:
+            print('heavy pool remove NAME', file=sys.stderr)
+            return 2
+        ok = heavypool.remove(home(), a.name)
+        print(f'Removed {a.name}. Its project copies stay in ~/{heavypool.ROOT} there until you delete them.' if ok
+              else f'There is no worker named {a.name}.')
+        return 0 if ok else 1
+    elif a.action == 'auto':
+        if a.name not in ('on', 'off'):
+            print(f"Pool auto mode is {'on' if s.get('pool_auto') else 'off'} (heavy pool auto on|off)")
+            return 0
+        set_setting('pool_auto', a.name == 'on')
+        print(f'Pool auto mode {a.name}: ' + (f"{', '.join(s.get('pool_kinds') or [])} jobs go to a worker that can "
+              'start them now, else run here. --no-pool keeps one here.' if a.name == 'on' else
+              'jobs run here unless sent with --pool.'))
+        return 0
+    d = heavypool.load(home())
+    if not d['workers']:
+        print('No workers yet. Add one: heavy pool add NAME USER@HOST [--key FILE]\n'
+              'It needs key-only SSH, python3 and HeavyGate 1.20+ (./install.sh), plus Java and the Android SDK for '
+              'Android builds.')
+        return 0
+    names = getattr(a, 'only', None) or ([a.name] if a.name else None)
+    infos = heavypool.check(home(), s, names)
+    if a.json:
+        print(json.dumps(infos, indent=2))
+        return 0
+    bad = 0
+    for n, inf in infos.items():
+        w = d['workers'][n]
+        print(f"  {n:10s} {w['host']}")
+        print('    ' + heavypool.worker_text(n, w, inf, s).split(': ', 1)[1])
+        if inf.get('ok'):
+            print(f"    HeavyGate {inf.get('version')}, "
+                  + ('RAM cap per job by systemd' if inf.get('scope') else
+                     'RAM cap per job by its own Job Object' if inf.get('windows') else
+                     'no systemd scope: no hard RAM cap, its own RAM guard still ends a job past its ceiling')
+                  + (f", Android SDK {inf['android_sdk']}" if inf.get('android_sdk') else '')
+                  + f", {inf.get('disk_free_gb', 0):.0f} GB free for project copies")
+            if inf.get('version') != VERSION:
+                print(f'    (this PC has HeavyGate {VERSION}; keep them the same)')
+        else:
+            bad += 1
+    auto = (f"on, {', '.join(s.get('pool_kinds') or [])} jobs go to a ready worker" if s.get('pool_auto')
+            else 'off (heavy pool auto on)')
+    print(f"Auto: {auto}. Workers keep {s['pool_reserve_mb'] / 1024:.1f} GB for themselves unless set per worker.")
+    return 1 if bad else 0
+
+
+def cmd_split(a, command):
+    """heavy split cpu|gpu -n NAME --items A B C | --items-from FILE [--on here,NAME] -- command {items}"""
+    import heavysplit
+    if not command:
+        print('heavy split: the command goes after --, with {items} where the items go', file=sys.stderr)
+        return 2
+    items = list(a.items or [])
+    if a.items_from:
+        try:
+            with open(a.items_from, encoding='utf-8') as f:
+                items += [x.strip() for x in f if x.strip() and not x.lstrip().startswith('#')]
+        except OSError as e:
+            print(f'heavy split: {e}', file=sys.stderr)
+            return 2
+    only = [x.strip() for x in a.on.split(',') if x.strip()] if a.on else None
+    return heavysplit.split(sys.modules[__name__], a.lane, a.name, items, command, only=only, extra=a.send,
+                            back=a.back, desktop=a.desktop)
+
+
+def cmd_pool_worker(a, command):
+    """The worker's side of a trip (heavypool.py): what this machine can take, a project copy, a run, the outputs."""
+    try:
+        if a.action == 'info':
+            print(json.dumps(heavypool.worker_info(sys.modules[__name__])))
+            return 0
+        if a.action == 'manifest':
+            print(json.dumps(heavypool.worker_manifest(a.key)))
+            return 0
+        if a.action == 'recv':
+            print(json.dumps(heavypool.worker_recv(a.key, sys.stdin.buffer)))
+            return 0
+        if a.action == 'run':
+            return heavypool.worker_run(sys.modules[__name__], a.key, a.sub, a.name or a.key, a.cap_mb, command,
+                                        lane=a.lane, desktop=a.desktop, from_host=a.from_host)
+        if a.action == 'desktop':
+            return heavypool.desktop_runner(a.key)
+        if a.action == 'stop':
+            return 0 if heavypool.worker_stop(a.key) else 1
+        if a.action == 'sums':
+            print(json.dumps(heavypool.worker_sums(a.key, a.patterns)))
+            return 0
+        if a.action == 'pack':
+            heavypool.worker_pack(a.key, json.loads(sys.stdin.read() or '[]'), sys.stdout.buffer)
+            sys.stdout.buffer.flush()
+            return 0
+    except heavypool.PoolError as e:
+        print(f'heavy pool-worker: {e}', file=sys.stderr)
+        return 2
+    return 2
+
+
 def cloud_first(lane, a, line, name):
     """Auto mode: a CPU job mapped to a GitHub workflow may run there instead. Returns the exit code when it went to
     GitHub (or must be rerun in the background), None to run it here. Never for the GPU lane, a job inside another
@@ -2019,6 +2497,8 @@ def cloud_first(lane, a, line, name):
     job = plan['job']
     if plan['where'] != 'cloud':
         say(f"mapped to {job['repo']} {job['workflow']} but runs here ({plan['rule']}): {plan['reason']}")
+        if getattr(a, 'here_why', None) is not None:
+            a.here_why.append(f"kept off GitHub: {plan['reason']}")
         return None
     if getattr(a, 'wait_max', None) is not None and not a.no_wait:   # a foreground agent call: build here, don't wait on GitHub
         say(f"mapped to {job['repo']} {job['workflow']} but runs here: a foreground call can't wait for GitHub")
@@ -2290,7 +2770,8 @@ def snapshot(meter=None, daemons=True, lockfree=False):
             'biggest': [{'name': k, 'mb': v} for k, v in top_memory(8)],
             'daemons': daemon_summary() if daemons else None, 'ollama': ollama_models(),
             'ram_wait_min': settings()['ram_wait_min'], 'guard': guard_state(), 'cloud': cloud_summary(),
-            'disk': disk_state(lanes)}
+            'pool': heavypool.summary(home(), settings()), 'cache': cache_summary(), 'disk': disk_state(lanes)}
+
 
 
 def disk_state(lanes=()):
@@ -2440,6 +2921,8 @@ def status_text(snap):
                    + (f", {len(q)} queued" if q else '')))
         if j:
             out.append(row(j['state'], j))
+            if j.get('why'):
+                out.append(f"      why: {j['why']}")
             short = short or j['state'] == 'waiting for RAM'
         for i, qj in enumerate(q, 1):
             out.append(row(f'queued #{i}', qj))
@@ -2484,6 +2967,13 @@ def status_text(snap):
                    + (' (a build is running)' if d['building'] else ' (heavy free stops idle ones)'))
     if snap.get('cloud'):
         out += heavycloud.status_lines(snap['cloud'])
+    if snap.get('pool'):
+        out += heavypool.status_lines(snap['pool'], settings())
+    if snap.get('cache'):
+        c = snap['cache']
+        here = 'NOT used here: heavy cache on' if c['here'] != 'on' else 'used here' if c.get('relay') else \
+            'used here, but its link is down: heavy tray'
+        out.append(f"  BUILD CACHE on {c['host'] or '?'} ({here}): " + heavycache.stats_line(c['stats']))
     return '\n'.join(out)
 
 
@@ -2538,6 +3028,13 @@ def cmd_log(a):
                   f'{r.get("workflow")} {r.get("conclusion") or ""}' + (f"  {len(r['files'])} files to {r['dest']}"
                                                                          if r.get('files') else ''))
             continue
+        if r.get('pool'):
+            print(f'{(r.get("started") or "")[:19]:19s} {"pool":5s}{"":>7s} {"":>7s} {fmt_secs(r.get("ran_s")):>7s} '
+                  f'{str(r.get("exit")):>4s}  on {r["pool"]}, sent {r.get("sent_files", 0)} files '
+                  f'({r.get("sent_mb", 0):g} MB, {r.get("send_s", 0):g}s)'
+                  + (f', back {r["back_files"]} ({r.get("back_mb", 0):g} MB)' if r.get('back_files') is not None else '')
+                  + f'  {r["name"]}' + ('  !' + r['warning'] if r.get('warning') else ''))
+            continue
         gm = f"{r['gpu_util_max']:.0f}%" if r.get('gpu_util_max') is not None else '-'
         if 'lane_wait_s' in r:
             qw, rw = fmt_secs(r['lane_wait_s']), fmt_secs(r['ram_wait_s'])
@@ -2591,6 +3088,19 @@ def set_startup(on, guard=False):
     return os.path.exists(lnk)
 
 
+def cmd_apps(a):
+    """heavy apps [--close NAME...]: the user's own apps by memory, and closing them (heavyapps.py)."""
+    import heavyapps
+    if a.close:
+        out = heavyapps.close(a.close)
+        return 0 if all(v in ('closed', 'ended') for v in out.values()) else 1
+    if a.json:
+        print(json.dumps(heavyapps.apps(a.min_mb)))
+    else:
+        print(heavyapps.text(a.min_mb))
+    return 0
+
+
 def cmd_tray(a):
     """Start the tray icon without a console; a second one just exits (one per sign-in)."""
     if not WIN:
@@ -2601,9 +3111,48 @@ def cmd_tray(a):
         print(f'start at sign-in: {"on" if on else "off"} ({startup_shortcut()})')
         if a.at_sign_in == 'off':
             return 0
+    if not has_desktop():
+        return tray_in_desktop()
     subprocess.Popen([pythonw(), TRAY], close_fds=True,
                      creationflags=0x00000008 | 0x00000200 if WIN else 0)   # DETACHED_PROCESS, NEW_PROCESS_GROUP
     print('HeavyGate tray started (right-click it for the lanes; Exit is in its menu)')
+    return 0
+
+
+def has_desktop():
+    """False in an ssh session on Windows: its window station is hidden, so a tray icon started there is never seen."""
+    if not WIN:
+        return False
+
+    class USEROBJECTFLAGS(ctypes.Structure):
+        _fields_ = [('fInherit', wintypes.BOOL), ('fReserved', wintypes.BOOL), ('dwFlags', wintypes.DWORD)]
+    u = ctypes.WinDLL('user32')   # its own instance: argtypes set here don't touch anyone else's
+    u.GetProcessWindowStation.restype = wintypes.HANDLE
+    u.GetUserObjectInformationW.argtypes = [wintypes.HANDLE, ctypes.c_int, ctypes.c_void_p, wintypes.DWORD,
+                                            ctypes.c_void_p]
+    f = USEROBJECTFLAGS()
+    if not u.GetUserObjectInformationW(u.GetProcessWindowStation(), 1, ctypes.byref(f), ctypes.sizeof(f), None):
+        return True
+    return bool(f.dwFlags & 1)   # WSF_VISIBLE
+
+
+def tray_in_desktop():
+    """heavy tray from an ssh session (a pool worker): start it in the signed-in user's own session through a one-off
+    scheduled task (/IT), then delete the task; the tray keeps running. A second tray there just exits."""
+    task = 'HeavyGate-tray'
+    tr = subprocess.list2cmdline([pythonw(), TRAY])
+    r = subprocess.run(['schtasks', '/create', '/tn', task, '/tr', tr, '/sc', 'once', '/st', '00:00', '/it', '/f'],
+                       capture_output=True, text=True)
+    if r.returncode == 0:
+        r = subprocess.run(['schtasks', '/run', '/tn', task], capture_output=True, text=True)
+    time.sleep(3)
+    subprocess.run(['schtasks', '/delete', '/tn', task, '/f'], capture_output=True)
+    if r.returncode:
+        print(f'heavy tray: could not start it in the desktop session: {(r.stderr or r.stdout).strip()}',
+              file=sys.stderr)
+        return 1
+    print(f"HeavyGate tray started in {os.environ.get('USERNAME', 'the user')}'s desktop session on "
+          f"{os.environ.get('COMPUTERNAME', 'this machine')} (it shows only if someone is signed in)")
     return 0
 
 
@@ -2980,6 +3529,13 @@ def dependencies():
             ('Shut down when done', ' '.join(shutdown_command()), 'run by the guard once the lanes are done; '
              'HEAVYGATE_SHUTDOWN_CMD replaces it (parts split on |); polkit decides whether this user may'),
             ('Run history', os.path.join(home(), 'runs.jsonl'), 'finish-time estimates: median of the last 5 runs of the same job'),
+            ('Build cache', settings().get('cache_url') or '(not set up: heavy cache setup NAME)',
+             'a Gradle HTTP build cache on a pool worker (heavycache.py: its loopback only, a systemd socket starts it, it '
+             'stops when idle; reached over ssh); this machine uses it through ' + heavycache.init_path() + '; password in '
+             'cache_token; HEAVYGATE_CACHE=off skips it for one build'),
+            ('Pool', heavypool.pool_path(home()), 'workers (heavy pool add) and what each said last; ssh (OpenSSH) '
+             'with BatchMode, so key login only; a worker keeps project copies in ~/' + heavypool.ROOT
+             + ' and runs a job under systemd-run --user --scope with MemoryMax; jobs out now in pool-active'),
             ('Callers', 'the heavy script (or anything that runs python3 heavygate.py)', 'a test runner or build script can import heavygate and use hold()'),
         ]
     return [
@@ -3021,6 +3577,13 @@ def dependencies():
         ('Disk', ', '.join(watched_drives(cloud().drop_root)), 'free space (shutil.disk_usage) on the drive a job runs '
          'in, the temp drive and the profile drive (Gradle/NuGet/npm caches), plus disk_paths: disk_floor_gb to start, '
          'disk_stop_gb to keep running'),
+        ('Build cache', settings().get('cache_url') or '(not set up: heavy cache setup NAME)',
+         'a Gradle HTTP build cache on a pool worker (heavycache.py: its loopback only, a systemd socket starts it, it '
+         'stops when idle; reached over ssh); this machine uses it through ' + heavycache.init_path() + '; password in '
+         'cache_token; HEAVYGATE_CACHE=off skips it for one build'),
+        ('Pool', heavypool.pool_path(home()), 'workers (heavy pool add) and what each said last; ssh (OpenSSH) '
+         'with BatchMode, so key login only; a worker keeps project copies in ~/' + heavypool.ROOT
+         + ' and runs a job under systemd-run --user --scope with MemoryMax; jobs out now in pool-active'),
         ('Callers', 'heavy.cmd (or any wrapper that runs python heavygate.py)', 'a test runner or build script can import heavygate and use hold()'),
     ]
 
@@ -3315,6 +3878,15 @@ def main(argv=None):
     r.add_argument('--no-cloud', action='store_true', help='run it here even when auto mode would send it to GitHub')
     r.add_argument('--cloud', action='store_true', help='send this mapped build to GitHub (quota, charge and push '
                    'checks still apply; not counted against the auto caps)')
+    r.add_argument('--pool', nargs='?', const='', metavar='NAME', help='run it on a pool worker (NAME, or the one with '
+                   'the most room; it queues there if that worker is busy)')
+    r.add_argument('--no-pool', action='store_true', help='run it here even when pool auto mode would send it')
+    r.add_argument('--send', action='append', metavar='PATH', help='with --pool: also send this file or folder of the '
+                   'project although git ignores it (a built dist folder); again for more')
+    r.add_argument('--desktop', action='store_true', help='with --pool on a Windows worker: run it in the signed-in '
+                   "user's desktop session, where an app can open its window (WebView2 will not start over ssh)")
+    r.add_argument('--back', action='append', metavar='GLOB', help='with --pool: also bring back the files the job made '
+                   'that match (checks/**), even when it failed; again for more')
     st = sub.add_parser('status', help='what is running, waiting and queued on each lane; RAM/CPU/GPU now')
     st.add_argument('--json', action='store_true', help='the same as JSON, for other tools')
     st.add_argument('--peek', action='store_true', help='read the lanes without taking a lock or clearing dead tickets '
@@ -3337,6 +3909,13 @@ def main(argv=None):
     hk = sub.add_parser('hook', help='agent hook: JSON in, heavy commands go through auto; with -- COMMAND, a dry run')
     hk.add_argument('--shell', choices=['bash', 'powershell'], default='bash', help='the shell of a dry run')
     hk.add_argument('--wait', action='store_true', help='dry run of a background call, which waits its turn')
+    aps = sub.add_parser('apps', help='your apps using memory here; --close NAME closes them to make room for a build',
+                         description='Lists the signed-in user\'s own apps by memory (never Windows, HeavyGate, Python, '
+                         'SSH or a running lane job). --close asks each named app to close and ends it after 8 s if it '
+                         'is still running. The tray strip\'s "free RAM..." link opens the same list as a window.')
+    aps.add_argument('--close', nargs='+', metavar='NAME')
+    aps.add_argument('--min-mb', type=int, default=40)
+    aps.add_argument('--json', action='store_true')
     ru = sub.add_parser('rules', help='the rules that pick a lane: the window on Windows, text elsewhere')
     ru.add_argument('--list', action='store_true', help='print them instead of opening the window')
     cl = sub.add_parser('cloud', help='the cloud lane: GitHub Actions minutes, runs, and where a job should run',
@@ -3372,6 +3951,56 @@ def main(argv=None):
     cl.add_argument('--cached', action='store_true', help="don't call gh: show what was last read")
     cl.add_argument('--json', action='store_true')
     cl.add_argument('--count', dest='n_runs', type=int, default=12, help='runs: how many (default 12)')
+    po = sub.add_parser('pool', help='your other machines as more cpu lanes, over SSH (heavypool.py)',
+                        description='list (default): ask every worker now. add NAME USER@HOST: a worker (--key, --port, '
+                        '--reserve-mb, --heavy). remove NAME. install NAME / tray NAME (Windows workers: copy HeavyGate, show its tray there). auto on|off: send pool_kinds jobs (Gradle) to a ready '
+                        'worker. One job: heavy cpu --pool[=NAME] -- COMMAND.')
+    po.add_argument('action', nargs='?', default='list', choices=['list', 'add', 'remove', 'auto', 'install', 'tray'])
+    po.add_argument('name', nargs='?', help='the worker (add/remove/list), or on|off (auto)')
+    po.add_argument('host', nargs='?', help='add: USER@HOST or a Host from your ssh config')
+    po.add_argument('--key', help='add: the SSH private key file')
+    po.add_argument('--port', type=int, help='add: the SSH port')
+    po.add_argument('--reserve-mb', type=int, help='add: RAM the worker keeps for itself (default pool_reserve_mb)')
+    po.add_argument('--heavy', help='add: how to run HeavyGate there (default .local/bin/heavy; on Windows '
+                    f'{heavypool.WIN_HEAVY})')
+    po.add_argument('--json', action='store_true')
+    spl = sub.add_parser('split', help='one job of many items run as pieces on this PC and the pool workers at once',
+                         description='heavy split cpu -n NAME --items A B C -- python tests.py {items}: {items} '
+                         'becomes each piece\'s items (a word with {items} inside gets them joined by commas; without '
+                         'it they go on the end). Piece sizes follow how fast each machine did the last run.')
+    spl.add_argument('lane', choices=['cpu', 'gpu'])
+    spl.add_argument('-n', '--name', required=True, help='the job; its timing history is kept under this name')
+    spl.add_argument('--items', nargs='+', help='the items')
+    spl.add_argument('--items-from', help='a file with one item per line (# comments)')
+    spl.add_argument('--on', help='only these machines, comma separated: here and worker names')
+    spl.add_argument('--send', action='append', metavar='PATH', help='also send this file or folder of the project to '
+                     'the workers although git ignores it; again for more')
+    spl.add_argument('--desktop', action='store_true', help='pieces run in the desktop session of Windows workers '
+                     '(and only on Windows workers), where an app can open its window')
+    spl.add_argument('--back', action='append', metavar='GLOB', help='bring back the files each worker made that match '
+                     '(checks/**), even from a failed piece; again for more')
+    pk = sub.add_parser('pool-worker', help='the worker side of a pool trip (heavy pool runs it over SSH)')
+    pk.add_argument('action', choices=['info', 'manifest', 'recv', 'run', 'stop', 'sums', 'pack', 'desktop'])
+    pk.add_argument('key', nargs='?')
+    pk.add_argument('patterns', nargs='*')
+    pk.add_argument('--sub', default='')
+    pk.add_argument('-n', '--name')
+    pk.add_argument('--cap-mb', type=int)
+    pk.add_argument('--lane', default='cpu', choices=['cpu', 'gpu'])
+    pk.add_argument('--desktop', action='store_true')
+    pk.add_argument('--from', dest='from_host', default='', help='run: the machine that sent it (its strip says so)')
+    ca = sub.add_parser('cache', help='a shared Gradle build cache on a pool worker (heavycache.py)',
+                        description='status (default): entries, size, hits, asleep or awake (asked over ssh). setup '
+                        'NAME: run it on pool worker NAME (on its loopback only, started by a systemd socket on the '
+                        'first request, stopped after cache_idle_min idle; a new password). on | off: every Gradle '
+                        'build on this PC and the pool workers uses it through ssh, or not. remove: off, and the '
+                        "server's socket and service removed. serve: the server itself. tunnel: this PC's ssh link "
+                        'in the foreground (the tray runs it).')
+    ca.add_argument('action', nargs='?', default='status',
+                    choices=['status', 'setup', 'on', 'off', 'remove', 'serve', 'tunnel', '_host', '_host-remove',
+                             '_client-on', '_client-off'])
+    ca.add_argument('name', nargs='?', help='setup: the pool worker that runs it')
+    ca.add_argument('--json', action='store_true')
     sv = sub.add_parser('service', help='Linux: run the RAM guard (and shut down when done) as a systemd user service',
                         description='install: write ~/.config/systemd/user/heavygate.service and start it, so the guard '
                         'runs on a server with nobody signed in. remove: stop it and delete the unit. status: is it '
@@ -3415,10 +4044,20 @@ def main(argv=None):
         return cmd_guard(a)
     if a.cmd == 'service':
         return cmd_service(a)
+    if a.cmd == 'pool':
+        return cmd_pool(a)
+    if a.cmd == 'cache':
+        return cmd_cache(a)
+    if a.cmd == 'pool-worker':
+        return cmd_pool_worker(a, command)
+    if a.cmd == 'split':
+        return cmd_split(a, command)
     if a.cmd == 'watch':
         return cmd_watch(a)
     if a.cmd == 'tray':
         return cmd_tray(a)
+    if a.cmd == 'apps':
+        return cmd_apps(a)
     if a.cmd is None:
         a.json = False
     if a.cmd == 'status' or a.cmd is None:

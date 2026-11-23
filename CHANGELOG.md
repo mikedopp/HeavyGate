@@ -1,5 +1,204 @@
 # HeavyGate changelog
 
+## 1.34.0 (2026-11-22)
+
+- **Auto mode can send .NET and Rust builds** (`"pool_kinds": ["gradle", "dotnet", "cargo"]`), and they come back
+  whole:
+  - an output folder the command names (`dotnet publish -o dist\App-1.2-win-x64`, `cargo --target-dir`,
+    `--artifact-dir`) is brought back too, even when its files keep old times (publish copies them out of an
+    up-to-date `bin`);
+  - a build that writes outside the project a trip sends (`-o ..\elsewhere`) stays here in auto mode, and `--pool`
+    warns that the output stays on the worker.
+- `pool_auto_skip` reads per kind: `dotnet publish` is a build and may go; `dotnet nuget push` and installs stay here.
+
+## 1.33.0 (2026-11-22)
+
+- **The strip lists what is using the memory.** Under the RAM line, up to four of your own apps over 150 MB, biggest
+  first, each with its size and a **close** link: it asks that app's windows to close (as its X does) and ends it if
+  it is still running 8 s later. The app leaves the list while it closes. It is the same list as the free-RAM window
+  (never Windows, security, HeavyGate, Python, SSH, dev tools or a lane's job), replacing the old "biggest:" note,
+  which named any process, WebView2 helpers included.
+
+## 1.32.1 (2026-11-22)
+
+- **A pool key Windows' own ssh refuses is fixed, not reported as an unreachable worker.** The tray runs
+  `System32\OpenSSH\ssh.exe`, which ignores a private key that any other account can read ("bad permissions ... This
+  private key will be ignored", then "Permission denied (publickey)"). Git's ssh doesn't check, so the same worker
+  answered from a Git shell and showed as unreachable in the tray. A key file inherits its folder's permissions, and a
+  profile carried over from an older Windows install can still list a deleted account there. The first time a
+  process uses a pool key, HeavyGate checks it, and if anyone but you, SYSTEM or Administrators can read it, keeps only
+  you and SYSTEM and says so.
+
+## 1.32.0 (2026-11-22)
+
+- **"free RAM..." on the strip** (and "Free RAM: close apps..." in the tray menu) opens a small window that lists your
+  own apps by memory, with a checkbox each. "Close ticked" asks each app's windows to close, as clicking its X does,
+  and ends whatever is still running 8 s later (unsaved work in it is lost; the window says so). It never lists
+  Windows, its shell, services and security, HeavyGate, Python, SSH, dev tools, or any process of a job running in a
+  lane. A pool worker shows the link on its own strip, so the person at that machine can make room for a build.
+- **`heavy apps`** lists the same apps as text (`--json`, `--min-mb`); `heavy apps --close NAME...` closes them. Over
+  ssh it lists the signed-in user's desktop session, so you can see from another machine what is using a worker's
+  RAM.
+
+## 1.31.0 (2026-11-22)
+
+- **A dropped login is tried again.** Windows' SSH server drops a login when several start at once ("banner exchange
+  ... connection abort") and under load can refuse a good key once ("Permission denied (publickey)"). One of those
+  marked the laptop worker unreachable in the tray, or failed a trip. Every pool call (asking a worker, sending the
+  project, the job, bringing files back) now tries a failed login up to 3 times. Only a failure before the remote
+  command started is retried: a job that ran and failed is never run again, and a refused connection (machine off)
+  still fails at once. Measured: 28 status asks at the laptop at once all answered (1 in 12 dropped before).
+- **A worker's strip says who sent the job**: "why: sent from MAIN-PC by heavy pool, cpu lane" (`pool-worker run
+  --from`). Workers need 1.31.0 for trips from a 1.31.0 machine.
+
+## 1.30.0 (2026-11-22)
+
+- **`heavy pool tray NAME`**: a Windows worker shows its own tray and strip, so a job sent there is seen on its
+  screen like one on this PC. It starts in the signed-in user's desktop session (a one-off task, deleted after) and
+  at every sign-in after (Startup shortcut). `heavy tray` run over ssh does the same instead of starting an icon
+  nobody can see.
+- `heavy pool install` copies the tray and rules windows (`heavy*.pyw`) too.
+
+## 1.29.0 (2026-11-22)
+
+- **`--desktop`** for pool trips and `heavy split`: on a Windows worker the job runs in the signed-in user's desktop
+  session (a one-off scheduled task, no console window), where an app can open its window. WebView2 won't start in
+  an ssh session. Output streams back, the job's exit code and the lane's RAM cap stay, the task is deleted after.
+  Refused for a worker that isn't Windows (the job runs here).
+- `--send` files don't count against `pool_max_send_mb` (they were named on purpose); the project still does.
+- Measured: a 3D desktop app's quick checks PASS on the laptop worker in its desktop session (5 scenarios,
+  12 shots, GTX 1650).
+
+## 1.28.0 (2026-11-22)
+
+- **`--send PATH` and `--back GLOB`** for pool trips and `heavy split`: send a file or folder of the project that git
+  ignores (a built dist folder), and bring back the files the job made that match, even when it failed. A path
+  outside the project keeps the job here.
+- **3D checks on a Windows worker's graphics card**: headless Edge over ssh gets the real GPU (GTX 1650 through
+  Direct3D 11 on the laptop). A 3D map app's screenshot check ran there and its shots came back SHA256-checked.
+- A failed bring-back no longer turns a failing job's exit code into 1.
+
+## 1.27.0 (2026-11-22)
+
+- **A gpu lane job can go to a worker**: `heavy gpu --pool=NAME` (or `--pool` for the first worker with a graphics
+  card) runs it in that Windows worker's gpu lane. It used to run here without a word. A worker without a graphics
+  card says so and the job runs here; without `--pool` the gpu lane never leaves this PC.
+- **Fix: with git 2.5x a Gradle build with ignored files under src stayed here.** Newer git also lists a folder that
+  only holds ignored files (`app/src/main/`) as ignored; HeavyGate now keeps only what `git check-ignore` confirms, and
+  takes the files of an ignored folder under src one by one, as it did with older git.
+- The selftest runs on a Windows worker over ssh: thread counts come from the machine's share and the lane's
+  processors, window and tray tests are skipped without a desktop, and the cloud tests skip without git.
+- Measured on real machines: the selftest's 127 tests split across this PC, two Linux servers and a Windows laptop
+  in 73 s, all passing (about 270 s on this PC alone).
+
+## 1.26.0 (2026-11-22)
+
+- **Windows workers.** `heavy pool add` asks a machine what it runs; a Windows PC gets HeavyGate copied into
+  `~\HeavyGate` (`heavy pool install NAME` again after an update) and its jobs go through cmd.exe with every word
+  quoted for it (a word with `%` or `"` keeps the job here). `gradlew.bat` stays as it is, no CRLF change, the RAM cap
+  is the worker's own Job Object, and a job can go to the worker's gpu lane. `heavy pool` shows its OS and graphics card.
+- **`heavy split`**: one job of many items as pieces on this PC and the workers at once, `{items}` where they go.
+  Piece sizes follow each machine's speed on the last passing run; the gpu lane splits only to Windows workers with a
+  graphics card. Measured: the selftest's 127 tests in 87-90 s on this PC and two servers, about 270 s here alone.
+- **Fix: a job's own words with & | < > ^ ( ) went to cmd.exe unquoted on Windows**, so `heavy cpu -- python x.py
+  "a&b"` ran `b` as a command. Such words are quoted now; a word that is only an operator (`&&`, `2>&1`) is left alone.
+- The selftest runs inside a lane too (as a split piece does): it measures priority and processors from where it
+  starts, and keeps its disk tests off a /tmp in RAM.
+
+## 1.25.0 (2026-11-22)
+
+- **The build cache no longer crosses the LAN in the clear.** In 1.24.0 it spoke plain HTTP on the LAN, so its password
+  could be read by anything watching the network. Now it listens on its server's loopback only, the LAN firewall rule
+  is taken away, and every other machine reaches it through ssh with the pool's keys: a systemd socket on each pool
+  worker runs one `ssh -W` per connection, and the tray carries this PC's link the same way (`heavy cache tunnel`
+  without the tray). Run `heavy cache setup NAME` and `heavy cache on` again to move a 1.24.0 cache over.
+- **The cache runs only while builds use it.** A systemd socket on the server starts it on the first request; it stops
+  itself after `cache_idle_min` (10) with no request. Its counters are saved, so they carry on across starts, and
+  `heavy cache`, `heavy status` and the tray read them over ssh from the pool's answer, which doesn't wake it.
+  Measured with each machine's own Gradle cache moved aside, so the hits came through the links: one server 49 s became
+  19 s, this PC 33 s became 17 s. (1.24.0's figures may have come partly from each machine's own cache.)
+
+## 1.24.0 (2026-11-22)
+
+- **A shared Gradle build cache.** `heavy cache setup NAME` runs a Gradle HTTP build cache on a pool worker (a
+  systemd user service, port open to the LAN only, a new password, least recently used entries dropped past 5 GB), and
+  `heavy cache on` points every Gradle build on this PC and the pool workers at it with one init file. A clean build
+  that another machine already ran takes the outputs from the cache: on one server 49 s became 19 s, on this PC 41 s became 22 s.
+  `HEAVYGATE_CACHE=off` skips it for one build; `heavy cache off` / `remove` undo it.
+- **The cache in status and the tray.** `heavy status` has a BUILD CACHE line (entries, size, hits and misses, whether
+  this PC uses it), and the all-lanes view has a CACHE row, asked in the background with the pool workers.
+
+## 1.23.0 (2026-11-22)
+
+- **Two views on the strip: in use only, and all lanes.** "In use only" (the default) shows just what is running,
+  waiting or queued and hides when all is idle. "All lanes" lists every lane, free or busy: the GPU lane, each CPU slot,
+  each pool worker (ready or busy, free RAM, its lane, when it was last asked; asked again every minute in the
+  background) and GitHub Actions (running, or idle with the minutes left). Switch with the link on the strip or "Show all
+  lanes" in the strip settings.
+- **Every job says why it runs where it does.** The rule that put it on its lane, why the pool or GitHub didn't take it
+  (a skip word, an ignored input, no worker free and why), or why a worker did (auto mode, the most room). Shown as
+  `why:` under each job in `heavy status` and on the strip.
+- **App bundles go to the pool too.** An `.aab` a worker builds is signed again here with the key a local build uses,
+  with the JDK's jarsigner (the worker's signature taken off first, the certificate checked with keytool), so
+  `bundleRelease` left `pool_auto_skip` (it comes back with `pool_resign` off).
+- **Bring-back fix.** A file the worker kept from an older build that never came back here (a debug APK from another
+  trip) stays there, and an APK signed and renamed here (app-release-unsigned.apk to app-release.apk) is not fetched
+  again. Before, both came back on the next trip and the second replaced the signed APK.
+
+## 1.22.0 (2026-11-22)
+
+- **The tray shows jobs out on the pool.** A trip holds no lane here, so the strip above the clock, the hover text and
+  the menu showed nothing while a build ran on a worker. Now each one is a row: the job, the worker it went to, how long,
+  and what it is doing (sending the changes, building there, bringing the files back, signing the APKs here), with what
+  was sent and the RAM cap there. The menu also lists the workers. `heavy status` shows the same phase.
+- **Build scripts reach the pool.** A script's Gradle step that goes through `heavy.cmd` can now go to a worker:
+  absolute paths into the project (`C:\App\android\gradlew.bat -p C:\App\android`) become paths in the worker's
+  copy (a path outside the project keeps the job here; a tool of this PC becomes the worker's own), the Gradle folder is
+  found from `-p` or beside the gradlew it calls, and a Gradle step inside a job that already holds a lane may go out.
+  The README shows the few lines a `.cmd` or `.ps1` script needs.
+- **Outputs come back by hash.** A trip now asks the worker for the SHA256 of every output (`pool-worker sums`) and
+  brings back what is missing here or changed since it last came back, instead of only what the job just wrote. A build
+  folder cleaned here gets its APK back even when the worker had nothing to rebuild. Gradle outputs also cover
+  `build/install/**` (`installDist`) and `build/libs/**`.
+- **More ignored inputs keep a build here.** Besides files the Gradle scripts name, any git-ignored file inside a `src`
+  folder and an ignored module folder with its own build script now keep an auto-mode build here: a Capacitor app's
+  synced web files, `config.xml` and Cordova plugins, or a generated catalog in the assets, would be missing on the
+  worker. `:core:installDist` no longer counts as an `install` job.
+
+## 1.21.0 (2026-11-22)
+
+- **APKs from a worker are signed here.** A worker never gets a signing key, so what it builds carries its own debug key
+  (or none) and won't install over your app. Now every APK a trip brings back is signed again on this PC with the key a
+  local build uses (`heavysign.py`): a release APK of a project with `keystore.properties` gets that key, everything
+  else this PC's debug key. The signed APK's certificate is checked against the keystore's; one that can't be signed is
+  renamed `.apk.worker-signed` and the job exits 1. So release builds may go to the pool now: `release` and `sign` left
+  `pool_auto_skip` (they come back with `pool_resign` off).
+- **A build that reads an ignored file stays here.** When the Gradle scripts name a file git ignores (an API key file
+  copied into the assets), a trip can't send it and the worker would quietly build without it. Auto mode keeps that
+  build here; `--pool` sends it with a warning. Ignored copies of tracked files and signing files don't count.
+
+## 1.20.0 (2026-11-22)
+
+- **The pool: your other machines as more cpu lanes, over SSH.** `heavy pool add NAME USER@HOST --key FILE` adds a
+  worker (a Linux server, for now); `heavy pool` asks each one now and says whether it could take a job, or why not.
+  `heavy cpu --pool[=NAME] -- gradlew assembleDebug` sends one job; `heavy pool auto on` sends every Gradle job to a
+  worker that can start it now, and runs it here when none can. Nothing runs on a worker but SSH and HeavyGate.
+- A trip copies the project's git checkout to the worker, sending only what changed and never ignored files or
+  `local.properties`; runs the job in the worker's own cpu lane under a systemd `MemoryMax` that leaves the worker
+  `pool_reserve_mb` (2 GB) for its own services; streams the output; and brings back what it made
+  (`build/outputs/**` for Gradle), each file checked against its SHA256. `gradlew.bat` becomes `./gradlew
+  --no-daemon`, and scripts get LF line endings and the executable bit on the way. Anything that fails before the job
+  starts there runs it here instead.
+- **Keys stay here.** Auto mode keeps release, bundle, publish, sign, install and device jobs on this PC
+  (`pool_auto_skip`): release builds sign with this PC's keys, and installs need the phone plugged in here. Key files
+  (`*.jks`, `*.keystore`, `*.p12`, `*.pfx`, `*.pem`, `*.key`, `keystore.properties`, `.env` ...) are never sent, even
+  when git tracks them.
+- `heavy status` lists the workers and jobs out on them; `heavy log` shows each trip. Pool runs don't count toward
+  this PC's finish-time estimates.
+- New self-tests: a whole trip against a stand-in `ssh` (sent, run in the worker's lane, outputs back, only changes
+  sent the second time, deletions carried), a failed job, an unreachable worker, the worker choice, command translation
+  and path safety.
+
 ## 1.19.1 (2026-11-21)
 
 Found by running 1.19.0 on a real Linux server over SSH.
